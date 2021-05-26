@@ -73,36 +73,29 @@ void smeMM(real* __restrict__ A, real* __restrict__ B,
            int M, int N, const int K, bool isVec) {
 
     int blockRow = blockIdx.y * blockDim.y;
-    int row = threadIdx.y;
-    int gRow = blockRow + row;
-
     int blockCol = blockIdx.x * blockDim.x;
+    int row = threadIdx.y;
     int col = threadIdx.x;
+    int gRow = blockRow + row;
     int gCol = blockCol + col;
 
-    int blockSize = blockDim.y;
-    int steps = (K + blockSize - 1) / blockSize;
-
     real accumulator = 0;
-    for (int k = 0; k < steps; ++k) {
-        __shared__ real A_block[BLOCK_SIZE][BLOCK_SIZE];
-        __shared__ real B_block[BLOCK_SIZE][BLOCK_SIZE];
-
-        real* A_submat = A + (blockRow + k * blockSize * M);
-        real* B_submat = B + (k * blockSize + blockCol * K);
-
+    for (int i = 0; i < K; i += BLOCK_SIZE) {
+        __syncthreads();
+        __shared__ real A_block[BLOCK_SIZE * BLOCK_SIZE];
+        __shared__ real B_block[BLOCK_SIZE * BLOCK_SIZE];
         if (gRow < M && i + col < K) {
-            A_block[row][col] = A_submat[row + col * M];
+            A_block[row + col * BLOCK_SIZE] = A[gRow + (i + col) * M];
         }
         if (gCol < N && i + row < K) {
-            B_block[row][col] = B_submat[row + col * K];
+            B_block[row + col * BLOCK_SIZE] = B[(i + row) + gCol * K];
         }
 
         __syncthreads();
         
         if (gRow < M && gCol < N) {
-            for (int j = 0; j < min(blockSize, K - i * blockSize); j++) {
-                accumulator += A_block[row][j] * B_block[j][col];
+            for (int j = 0; j < min(BLOCK_SIZE, K - i); j++) {
+                accumulator += A_block[row + j * BLOCK_SIZE] * B_block[j + col * BLOCK_SIZE];
             }
         }
     }

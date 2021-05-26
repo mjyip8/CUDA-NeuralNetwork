@@ -41,7 +41,7 @@ inline double stop_timer(event_pair* p) {
 }
 
 int myGEMM(real* A, real* B, real* C, real* alpha, real* beta, int M, int N,
-           int K);
+           int K, bool isVec=true);
 
 // TODO
 // Add additional function declarations

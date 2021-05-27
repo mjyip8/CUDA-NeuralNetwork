@@ -3,11 +3,13 @@
 #include <chrono>
 #include <fstream>
 #include <iomanip>
+#include <armadillo>
 
 #include "cublas_v2.h"
 #include "gpu_func.h"
 #include "mpi.h"
 #include "types.h"
+#include "common.h"
 using namespace std;
 
 #define SCALE 1       // Factor to SCALE the GEMM problem size by
@@ -267,4 +269,125 @@ void BenchmarkGEMM() {
             << "M = " << M << "; N = " << N << "; K = " << K << std::endl;
   TestGEMM(M, N, K);
   std::cout << "Completed GEMM 2" << std::endl;
+}
+
+void print_mat(arma::Mat<real> my_matrix) {
+    
+    uint cols = my_matrix.n_cols;
+    uint rows = my_matrix.n_rows;
+    
+    std::cout << "--------\n";
+    for(uint rX = 0; rX < rows; rX++) {
+        std::cout << " " << rX << ": ";
+        for(uint cX = 0; cX < cols; cX++) {
+            std::cout << my_matrix(rX, cX) << " ";
+        }
+        std::cout << "\n";
+    }
+    std::cout << "--------\n";
+}
+
+void TestKernels() {
+  using namespace std::chrono;
+  int test_batch_size = 267;
+  /* softmax test */
+  std::cout << "\n************Softmax Kernel************" << std::endl;
+  arma::Mat<real> A(10, test_batch_size);
+  arma::Mat<real> A_result(10, test_batch_size);
+  A.randu();
+  A *= 10.;
+
+  high_resolution_clock::time_point t1_cpu = high_resolution_clock::now();
+  softmax(A, A_result);
+  high_resolution_clock::time_point t2_cpu = high_resolution_clock::now();
+  duration<double> time_span_cpu = duration_cast<duration<double>>(t2_cpu - t1_cpu);
+
+  real* dA;
+  arma::Mat<real> dA_result(10, test_batch_size);
+  cudaMalloc(&dA, sizeof(real) * A.n_elem);
+  cudaMemcpy(dA, A.memptr(), sizeof(real) * A.n_elem, cudaMemcpyHostToDevice);
+
+  high_resolution_clock::time_point t1_gpu = high_resolution_clock::now();
+  real* result = deviceSoftmax(dA, A.n_rows, A.n_cols);
+  high_resolution_clock::time_point t2_gpu = high_resolution_clock::now();
+  duration<double> time_span_gpu = duration_cast<duration<double>>(t2_gpu - t1_gpu); 
+
+  cudaMemcpy(dA_result.memptr(), dA, sizeof(real) * A.n_elem, cudaMemcpyDeviceToHost);
+  cudaFree(dA);
+  cudaFree(result);
+
+  int fail = compareGEMMResults(dA_result.memptr(), A_result.memptr(), A.n_rows, A.n_cols);
+  if (fail == 0) {
+    std::cout << "Time for CPU Softmax implementation: "
+              << time_span_cpu.count() << " seconds" << std::endl;
+    std::cout << "Time for GPU Softmax implementation: " << time_span_gpu.count()
+              << " seconds" << std::endl;
+  }
+
+  /* sigmoid test */
+  std::cout << "\n************Sigmoid Kernel************" << std::endl;
+  A.randu();
+  A *= 10.;
+  t1_cpu = high_resolution_clock::now();
+  sigmoid(A, A_result);
+  t2_cpu = high_resolution_clock::now();
+  time_span_cpu = duration_cast<duration<double>>(t2_cpu - t1_cpu);
+
+  cudaMalloc(&dA, sizeof(real) * A.n_elem);
+  cudaMemcpy(dA, A.memptr(), sizeof(real) * A.n_elem, cudaMemcpyHostToDevice);
+
+  t1_gpu = high_resolution_clock::now();
+  result = deviceSigmoid(dA, A.n_rows, A.n_cols);
+  t2_gpu = high_resolution_clock::now();
+  time_span_gpu = duration_cast<duration<double>>(t2_gpu - t1_gpu); 
+
+  cudaMemcpy(dA_result.memptr(), dA, sizeof(real) * A.n_elem, cudaMemcpyDeviceToHost);
+  cudaFree(dA);
+  cudaFree(result);
+
+  fail = compareGEMMResults(dA_result.memptr(), A_result.memptr(), A.n_rows, A.n_cols);
+  if (fail == 0) {
+    std::cout << "Time for CPU Sigmoid implementation: "
+              << time_span_cpu.count() << " seconds" << std::endl;
+    std::cout << "Time for GPU Sigmoid implementation: " << time_span_gpu.count()
+              << " seconds" << std::endl;
+  } else {
+    A_result.save("Outputs/CPUmats/CPUsigmoid.mat", arma::raw_ascii);
+    dA_result.save("Outputs/GPUmats/GPUsigmoid.mat", arma::raw_ascii);
+  }
+
+  /* sum reduction test */
+  std::cout << "\n************Sum Reduction Kernel************" << std::endl;
+  A.randu();
+  A *= 10.;
+  t1_cpu = high_resolution_clock::now();
+  arma::Mat<real> A_sum = arma::sum(A, 1);
+  t2_cpu = high_resolution_clock::now();
+  time_span_cpu = duration_cast<duration<double>>(t2_cpu - t1_cpu);
+
+  cudaMalloc(&dA, sizeof(real) * A.n_elem);
+  cudaMemcpy(dA, A.memptr(), sizeof(real) * A.n_elem, cudaMemcpyHostToDevice);
+  cudaMalloc(&result, sizeof(real) * 10);
+
+  t1_gpu = high_resolution_clock::now();
+  deviceSum(dA, result, A.n_rows, A.n_cols);
+  t2_gpu = high_resolution_clock::now();
+  time_span_gpu = duration_cast<duration<double>>(t2_gpu - t1_gpu); 
+
+  arma::Mat<real> dA_sum(10, 1);
+  cudaMemcpy(dA_sum.memptr(), result, sizeof(real) * dA_sum.n_elem, cudaMemcpyDeviceToHost);
+  cudaFree(dA);
+  cudaFree(result);
+
+  fail = compareGEMMResults(dA_sum.memptr(), A_sum.memptr(), A_sum.n_rows, A_sum.n_cols);
+  if (fail == 0) {
+    std::cout << "Time for CPU Sum implementation: "
+              << time_span_cpu.count() << " seconds" << std::endl;
+    std::cout << "Time for GPU deviceSum implementation: " << time_span_gpu.count()
+              << " seconds" << std::endl;
+  } else {
+    A_sum.save("Outputs/CPUmats/CPUsum.mat", arma::raw_ascii);
+    dA_sum.save("Outputs/GPUmats/GPUsum.mat", arma::raw_ascii);
+  }
+
 }

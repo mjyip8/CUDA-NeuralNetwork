@@ -35,7 +35,8 @@ cd $SLURM_SUBMIT_DIR
 # Grading mode 4
 # echo "./main -g 4"
 # ./main -g 4
-./main -g 4
+# ./main -g 4
+./main -g 5
 
 # Comment out to run the rest
 exit 0

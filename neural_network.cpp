@@ -293,6 +293,21 @@ void train(NeuralNetwork& nn, const arma::Mat<real>& X,
   }
 }
 
+/*********************************************************************************
+ *                          PARALLEL IMPLEMENTATION
+ *********************************************************************************/
+
+/* HELPER FUNCTIONS */
+void initialize_grads(struct grads& grad, NeuralNetwork& nn) {
+  grad.dW.resize((size_t) nn.num_layers);
+  grad.db.resize((size_t) nn.num_layers);
+
+  for (int i = 0; i < nn.num_layers; ++i) {
+    grad.dW[i] = arma::zeros<arma::Mat<real>>(arma::size(nn.W[i]));
+    grad.db[i] = arma::zeros<arma::Col<real>>(arma::size(nn.b[i]));
+  }
+}
+
 /*
  * TODO
  * Train the neural network nn of rank 0 in parallel. Your MPI implementation
@@ -313,16 +328,14 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
   error_file.open("Outputs/CpuGpuDiff.txt");
   int print_flag = 0;
 
-  /* HINT: You can obtain a raw pointer to the memory used by Armadillo Matrices
-     for storing elements in a column major way. Or you can allocate your own
-     array memory space and store the elements in a row major way. Remember to
-     update the Armadillo matrices in NeuralNetwork &nn of rank 0 before
-     returning from the function. */
+  // Device variables 
+  DeviceNeuralNetwork dnn(nn.H);
+  dnn.CopyToDevice(nn.W, nn.b);
 
-  // TODO
+  DeviceGrads dgrads(nn.H);
+  struct grads bpgrads;
+  initialize_grads(bpgrads, nn);
 
-  /* iter is a variable used to manage debugging. It increments in the inner
-     loop and therefore goes from 0 to epochs*num_batches */
   int iter = 0;
 
   for (int epoch = 0; epoch < epochs; ++epoch) {
@@ -331,7 +344,7 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
     for (int batch = 0; batch < num_batches; ++batch) {
       /*
        * Possible implementation:
-       * 1. subdivide input batch of images and `MPI_scatter()' to each MPI node
+       * 
        * 2. compute each sub-batch of images' contribution to network
        * coefficient updates
        * 3. reduce the coefficient updates and broadcast to all nodes with
@@ -339,7 +352,15 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
        * 4. update local network coefficient at each node
        */
 
-      // TODO
+      // 1. subdivide input batch of images and `MPI_scatter()' to each MPI node
+      int last_col = std::min((batch + 1) * batch_size - 1, N - 1);
+      arma::Mat<real> X_batch = X.cols(batch * batch_size, last_col);
+      arma::Mat<real> y_batch = y.cols(batch * batch_size, last_col);
+
+      DeviceCache cache(nn.H, X_batch.n_cols, X_batch.memptr());
+      DeviceData data(X_batch.memptr(), y_batch.memptr(), X_batch.n_cols, X_batch.n_rows);
+
+      real contribution = 1.;
 
       // +-*=+-*=+-*=+-*=+-*=+-*=+-*=+-*=+*-=+-*=+*-=+-*=+-*=+-*=+-*=+-*= //
       //                    POST-PROCESS OPTIONS                          //

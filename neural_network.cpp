@@ -147,6 +147,7 @@ void parallel_feedforward(DeviceNeuralNetwork& nn, real* X,
   myGEMM(nn.W[1], cache.z[0], cache.z[1], 1., 1., nn.H[2], N, nn.H[1], true);
 
   deviceSoftmax(cache.z[1], nn.H[2], N);
+
   cache.yc = cache.z[1];
 }
 
@@ -183,7 +184,7 @@ void parallel_backprop(DeviceNeuralNetwork& nn, real* y, real reg,
   deviceSubtract(bpcache.yc, diff, 1.0/N, nn.H[2], N);
 
   myGEMM(diff, bpcache.a[0], bpgrads.dW[1], 
-          contrib, contrib * reg, nn.H[1], nn.H[2], N, 
+          contrib, contrib * reg, nn.H[2], nn.H[1], N, 
           false, false, true);
 
   deviceSum(diff, bpgrads.db[1], contrib, nn.H[2], N);

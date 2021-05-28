@@ -13,9 +13,6 @@
 #define N_CLASSES 10
 #define SUM_STRIDE 32
 
-// TODO Figure out what to copy so things aren't modified
-// TODO Add the weighting factor
-
 /***************************************************************
  *                           KERNELS
  ***************************************************************/
@@ -35,13 +32,15 @@ void globalMM(real* __restrict__ A, real* __restrict__ B,
         for (int i = 0; i < K; i++) {
             int A_index = (transposeA)? i + row*K : row + i*M;
             int B_index = (transposeB)? col + i*N : i + col*K;
-            real a = A[A_index];
-            real b = B[B_index];
-            accumulator += a * b;
+            if (A_index < M * K && B_index < N * K) {
+                real a = A[A_index];
+                real b = B[B_index];
+                accumulator += a * b;
+            }
         }
         real add_term = 0.;
         if (beta) {
-            real C_term = (isVec) ? C[row] : C[row + col * M];
+            real C_term = (isVec) ? C[row + N*M] : C[row + col * M];
             add_term = beta * C_term;
         }
         C[row + col * M] = alpha * accumulator + add_term;
@@ -87,7 +86,7 @@ void smeMM(real* __restrict__ A, real* __restrict__ B,
     if (gRow < M && gCol < N) {
         real add_term = 0.;
         if (beta) {
-            real C_term = (isVec) ? C[gRow] : C[gRow + gCol * M];
+            real C_term = (isVec) ? C[gRow + N*M] : C[gRow + gCol * M];
             add_term = beta * C_term;
         }
         C[gRow + gCol * M] = alpha * accumulator + add_term;
@@ -154,7 +153,8 @@ void sigmoidBackward(real* S, real* A, int M, int N) {
     const int col = blockDim.y * blockIdx.y + threadIdx.y;
     if (row >= M || col >= N) return;
     real s = S[row + col * M];
-    A[row + col * M] *= (s * (1 - s));
+    real a = A[row + col * M];
+    A[row + col * M] = a * s * (1. - s);
 }
 
 template <unsigned int blockSize>
@@ -232,7 +232,7 @@ int myGEMM(real* __restrict__ A, real* __restrict__ B,
            bool isVec, bool transposeA, bool transposeB) {
     dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
     dim3 blocks((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
-    int algorithm = GLOBAL;
+    int algorithm = SMEM;
     switch (algorithm) {
         case GLOBAL:
             globalMM<<<blocks, threads>>>(A, B, C, alpha, beta, M, N, K, isVec, transposeA, transposeB);
@@ -245,10 +245,11 @@ int myGEMM(real* __restrict__ A, real* __restrict__ B,
 }
 
 int myGEMMAlloc(real* __restrict__ A, real* __restrict__ B,
-           real* __restrict__ C, real alpha, real beta,
+           real*& C, real alpha, real beta,
            int M, int N, int K, 
            bool isVec, bool transposeA, bool transposeB) {
-    checkCudaErrors( cudaMalloc((void**) &C, M * N * sizeof(double)) );
+    checkCudaErrors(cudaMalloc(&C, sizeof(real) * M * N));
+    checkCudaErrors(cudaMemset(C, 0, sizeof(real)));
     return myGEMM(A, B, C, alpha, beta, M, N, K, isVec, transposeA, transposeB);
 }
 
@@ -266,30 +267,19 @@ real* deviceLinear(real* A, real* B, real* C, real* alpha, real* beta, int M, in
     return result;
 }
 
-real* deviceSigmoid(real* Z, int M, int N) {
+void deviceSigmoid(real* Z, int M, int N) {
     real* result;
     checkCudaErrors(cudaMalloc(&result, sizeof(real) * M * N));
 
     dim3 threadDims(32, 32);
     dim3 blockDims((M + threadDims.x - 1) / threadDims.x, (N + threadDims.y - 1) / threadDims.y);
     sigmoid<<<blockDims, threadDims>>>(Z, M, N);
-
-    checkCudaErrors(cudaMemcpy(result, Z, sizeof(real) * M * N, cudaMemcpyDeviceToDevice));
-
-    return result;
 }
 
-real* deviceSoftmax(real* Z, int M, int N) {
-    real* result;
-    checkCudaErrors(cudaMalloc(&result, sizeof(real) * M * N));
-
+void deviceSoftmax(real* Z, int M, int N) {
     dim3 threadDims(SMAX_STRIDE, M);
     dim3 blockDims((N + threadDims.x - 1) / threadDims.x, 1);
     softmax<<<blockDims, threadDims>>>(Z, M, N);
-
-    checkCudaErrors(cudaMemcpy(result, Z, sizeof(real) * M * N, cudaMemcpyDeviceToDevice));
-
-    return result;
 }
 
 /*------------------ BACKWARD PASS WRAPPERS ---------------------*/

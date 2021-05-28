@@ -47,7 +47,7 @@ class DeviceNeuralNetwork {
                   std::vector<arma::Col<real>>& hdb) {
     for (int i = 0; i < num_layers; ++i) {
       checkCudaErrors(cudaMemcpy(W[i], hdW[i].memptr(), sizeof(real) * H[i + 1] * H[i], cudaMemcpyHostToDevice));
-      checkCudaErrors(cudaMemcpy(b[i], hdb[i].memptr(), sizeof(real) * H[i + 1], cudaMemcpyHostToDevice));
+      checkCudaErrors(cudaMemcpy(b[i], hdb[i].memptr(), sizeof(real) * H[i + 1] * H[i], cudaMemcpyHostToDevice));
     }
   }
 
@@ -65,6 +65,7 @@ class DeviceGrads {
 
       dW.resize((size_t) num_layers);
       db.resize((size_t) num_layers);
+      checkCudaErrors(cudaMalloc(&dW[1], sizeof(real) * H[2] * H[1]));
 
       for (int i = 0; i < num_layers; i++) {
         checkCudaErrors(cudaMalloc(&db[i], sizeof(real) * H[i + 1]));
@@ -75,12 +76,13 @@ class DeviceGrads {
       for (int i = 0; i < num_layers; ++i) {
         checkCudaErrors(cudaFree(db[i]));
       }
+      cudaFree(dW[1]);
     }
 
     void LoadWeightMatrices(std::vector<real *> W) {
-      for (int i = 0; i < num_layers; ++i) {
-        dW[i] = W[i];
-      }
+
+      dW[0] = W[0];
+      checkCudaErrors(cudaMemcpy(dW[1], W[1], sizeof(real) * H[2] * H[1], cudaMemcpyDeviceToDevice));
     }
 
     void CopyToHost(std::vector<arma::Mat<real>>& hdW, 
@@ -108,20 +110,25 @@ class DeviceCache {
       z.resize(2);
       a.resize(1);
 
+      checkCudaErrors( cudaMalloc(&z[0], (N + 1) * H[1] * sizeof(real)) );
+      checkCudaErrors( cudaMalloc(&z[1], (N + 1) * H[2] * sizeof(real)) );
+
       checkCudaErrors(cudaMalloc(&a[0], sizeof(real) * H[1] * N));
     } 
 
     ~DeviceCache() {
       checkCudaErrors(cudaFree(a[0]));
+      checkCudaErrors(cudaFree(z[0]));
+      checkCudaErrors(cudaFree(z[1]));
     }
 
     void recordAFromZ() {
       checkCudaErrors(cudaMemcpy(a[0], z[0], sizeof(real) * H[1] * N, cudaMemcpyDeviceToDevice));
     }
 
-    void LoadBias(std::vector<real *> b) {
+    void LoadBias(std::vector<real *>& b) {
       for (int i = 0; i < (int) z.size(); ++i) {
-        z[i] = b[i];
+        checkCudaErrors(cudaMemcpy(z[i] + (N * H[i+1]), b[i], sizeof(real) * H[i + 1], cudaMemcpyDeviceToDevice));
       }
     }
 };
@@ -192,17 +199,18 @@ int myGEMM(real* A, real* B, real* C, real* alpha, real* beta, int M, int N,
 int myGEMM(real* A, real* B, real* C, real alpha, real beta, int M, int N,
            int K, bool isVec=false, bool transposeA=false, bool transposeB=false);
 
-int myGEMMAlloc(real* A, real* B, real* C, real alpha, real beta, int M, int N,
+int myGEMMAlloc(real* A, real* B, real*& C, real alpha, real beta, int M, int N,
            int K, bool isVec=false, bool transposeA=false, bool transposeB=false);
+void transpose(real* A, real*& AT, int M, int N);
 
 /*------------------ FORWARD PASS WRAPPERS ---------------------*/
 
 real* deviceLinear(real* A, real* B, real* C, real* alpha, real* beta, int M, int N,
            int K, bool isVec=false, bool transposeB=false);
 
-real* deviceSigmoid(real* Z, int M, int N);
+void deviceSigmoid(real* Z, int M, int N);
 
-real* deviceSoftmax(real* Z, int M, int N);
+void deviceSoftmax(real* Z, int M, int N);
 
 /*------------------ BACKWARD PASS WRAPPERS ---------------------*/
 

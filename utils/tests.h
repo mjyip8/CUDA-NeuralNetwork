@@ -14,4 +14,6 @@ void BenchmarkGEMM();
 
 void TestKernels();
 
+void TestForwardBackProp();
+
 #endif

@@ -8,6 +8,8 @@
 
 #include "../utils/types.h"
 
+void deviceCleanUp(real* ptr);
+
 /***************************************************************
  *                     DEVICE CLASSES
  ***************************************************************/
@@ -30,7 +32,7 @@ class DeviceNeuralNetwork {
 
     for (int i = 0; i < num_layers; i++) {
       checkCudaErrors(cudaMalloc(&W[i], sizeof(real) * H[i + 1] * H[i]));
-      checkCudaErrors(cudaMalloc(&b[i], sizeof(real) * H[i + 1]));
+      checkCudaErrors(cudaMalloc(&b[i], sizeof(real) * H[i + 1] * H[i]));
     }
   }
 
@@ -41,29 +43,14 @@ class DeviceNeuralNetwork {
     }
   }
 
-  void CopyToDevice(std::vector<arma::Mat<real>>& hW, std::vector<arma::Col<real>>& hb) {
+  void CopyToDevice(std::vector<arma::Mat<real>>& hdW, 
+                  std::vector<arma::Col<real>>& hdb) {
     for (int i = 0; i < num_layers; ++i) {
-      checkCudaErrors(cudaMemcpy(W[i], hW[i].memptr(), sizeof(real) * H[i + 1] * H[i], cudaMemcpyHostToDevice));
-      checkCudaErrors(cudaMemcpy(b[i], hb[i].memptr(), sizeof(real) * H[i + 1], cudaMemcpyHostToDevice));
+      checkCudaErrors(cudaMemcpy(W[i], hdW[i].memptr(), sizeof(real) * H[i + 1] * H[i], cudaMemcpyHostToDevice));
+      checkCudaErrors(cudaMemcpy(b[i], hdb[i].memptr(), sizeof(real) * H[i + 1], cudaMemcpyHostToDevice));
     }
   }
 
-  void CopyToHost(std::vector<arma::Mat<real>>& hW, std::vector<arma::Col<real>>& hb) {
-    for (int i = 0; i < num_layers; ++i) {
-      checkCudaErrors(cudaMemcpy(hW[i].memptr(), W[i], sizeof(real) * H[i + 1] * H[i], cudaMemcpyDeviceToHost));
-      checkCudaErrors(cudaMemcpy(hb[i].memptr(), b[i], sizeof(real) * H[i + 1], cudaMemcpyDeviceToHost));
-    }
-  }
-
-  void CopyToDevice(real* hW, real* hb, int i) {
-    checkCudaErrors(cudaMemcpy(W[i], hW, sizeof(real) * H[i + 1] * H[i], cudaMemcpyHostToDevice));
-    checkCudaErrors(cudaMemcpy(b[i], hb, sizeof(real) * H[i + 1], cudaMemcpyHostToDevice));
-  }
-
-  void CopyToHost(real* hW, real* hb, int i) {
-    checkCudaErrors(cudaMemcpy(hW, W[i], sizeof(real) * H[i + 1] * H[i], cudaMemcpyDeviceToHost));
-    checkCudaErrors(cudaMemcpy(hb, b[i], sizeof(real) * H[i + 1], cudaMemcpyDeviceToHost));
-  }
 };
 
 class DeviceGrads {
@@ -80,15 +67,27 @@ class DeviceGrads {
       db.resize((size_t) num_layers);
 
       for (int i = 0; i < num_layers; i++) {
-        checkCudaErrors(cudaMalloc(&dW[i], sizeof(real) * H[i + 1] * H[i]));
         checkCudaErrors(cudaMalloc(&db[i], sizeof(real) * H[i + 1]));
       }
     }
 
     ~DeviceGrads() {
-      for (uint i = 0; i < dW.size(); ++i) {
-        checkCudaErrors(cudaFree(dW[i]));
+      for (int i = 0; i < num_layers; ++i) {
         checkCudaErrors(cudaFree(db[i]));
+      }
+    }
+
+    void LoadWeightMatrices(std::vector<real *> W) {
+      for (int i = 0; i < num_layers; ++i) {
+        dW[i] = W[i];
+      }
+    }
+
+    void CopyToHost(std::vector<arma::Mat<real>>& hdW, 
+                    std::vector<arma::Col<real>>& hdb) {
+      for (int i = 0; i < num_layers; ++i) {
+        checkCudaErrors(cudaMemcpy(hdW[i].memptr(), dW[i], sizeof(real) * H[i + 1] * H[i], cudaMemcpyDeviceToHost));
+        checkCudaErrors(cudaMemcpy(hdb[i].memptr(), db[i], sizeof(real) * H[i + 1], cudaMemcpyDeviceToHost));
       }
     }
 };
@@ -96,41 +95,41 @@ class DeviceGrads {
 class DeviceCache {
   public: 
     real* X;
+    int N;
     std::vector<real *> z;
     std::vector<real *> a;
     real* yc;
     std::vector<int> H;
 
-    DeviceCache(std::vector<int> _H, int N, real* _X) {
+    DeviceCache(std::vector<int> _H, int _N, real* _X) {
       H = _H;
+      N = _N;
+      X = _X; //copy of pointer to device X batch
       z.resize(2);
-      a.resize(2);
+      a.resize(1);
 
-      // copying over X
-      checkCudaErrors(cudaMalloc(&X, sizeof(real) * H[0] * N));
-      checkCudaErrors(cudaMemcpy(X, _X, sizeof(real) * H[0] * N, cudaMemcpyHostToDevice));
-
-      checkCudaErrors(cudaMalloc(&z[0], sizeof(real) * H[1] * N));
       checkCudaErrors(cudaMalloc(&a[0], sizeof(real) * H[1] * N));
-      checkCudaErrors(cudaMalloc(&z[1], sizeof(real) * H[2] * N));
-      checkCudaErrors(cudaMalloc(&a[1], sizeof(real) * H[2] * N));
-      checkCudaErrors(cudaMalloc(&yc,   sizeof(real) * H[2] * N));
     } 
 
     ~DeviceCache() {
-      checkCudaErrors(cudaFree(X));
-      checkCudaErrors(cudaFree(z[0]));
-      checkCudaErrors(cudaFree(z[1]));
       checkCudaErrors(cudaFree(a[0]));
-      checkCudaErrors(cudaFree(a[1]));
-      checkCudaErrors(cudaFree(yc));
+    }
+
+    void recordAFromZ() {
+      checkCudaErrors(cudaMemcpy(a[0], z[0], sizeof(real) * H[1] * N, cudaMemcpyDeviceToDevice));
+    }
+
+    void LoadBias(std::vector<real *> b) {
+      for (int i = 0; i < (int) z.size(); ++i) {
+        z[i] = b[i];
+      }
     }
 };
 
 class DeviceData {
   public: 
     real* X;
-    real* y;
+    real* y; // y is one hot
     int N;
     int K;
 
@@ -138,9 +137,9 @@ class DeviceData {
       N = _N;
       K = _K;
       checkCudaErrors(cudaMalloc(&X, sizeof(real) * N * K));
-      checkCudaErrors(cudaMalloc(&y, sizeof(real) * N));
+      checkCudaErrors(cudaMalloc(&y, sizeof(real) * N * K));
       checkCudaErrors(cudaMemcpy(X, hX, sizeof(real) * N * K, cudaMemcpyHostToDevice));   
-      checkCudaErrors(cudaMemcpy(y, hy, sizeof(real) * N, cudaMemcpyHostToDevice));
+      checkCudaErrors(cudaMemcpy(y, hy, sizeof(real) * N * K, cudaMemcpyHostToDevice));
     }
 
     ~DeviceData() {
@@ -189,7 +188,12 @@ inline double stop_timer(event_pair* p) {
  ***************************************************************/
 
 int myGEMM(real* A, real* B, real* C, real* alpha, real* beta, int M, int N,
-           int K, bool isVec=false, bool transposeB=false);
+           int K, bool isVec=false, bool transposeA=false, bool transposeB=false);
+int myGEMM(real* A, real* B, real* C, real alpha, real beta, int M, int N,
+           int K, bool isVec=false, bool transposeA=false, bool transposeB=false);
+
+int myGEMMAlloc(real* A, real* B, real* C, real alpha, real beta, int M, int N,
+           int K, bool isVec=false, bool transposeA=false, bool transposeB=false);
 
 /*------------------ FORWARD PASS WRAPPERS ---------------------*/
 
@@ -202,10 +206,10 @@ real* deviceSoftmax(real* Z, int M, int N);
 
 /*------------------ BACKWARD PASS WRAPPERS ---------------------*/
 
-real* deviceSubtract(real* A, real*B, real k, int M, int N);
+void deviceSubtract(real* A, real*B, real k, int M, int N);
 
-void deviceSum(real* A, real* result, int K, int N);
+void deviceSum(real* A, real* result, real k, int K, int N);
 
-real* deviceSigmoidBackward(real* S, real* A, int M, int N);
+void deviceSigmoidBackward(real* S, real* A, int M, int N);
 
 #endif

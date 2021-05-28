@@ -25,27 +25,34 @@
 __global__
 void globalMM(real* __restrict__ A, real* __restrict__ B,
            real* __restrict__ C, real alpha, real beta,
-           int M, int N, int K, bool isVec, bool transposeB) {
+           int M, int N, int K, 
+           bool isVec, bool transposeA, bool transposeB) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
 
     if (row < M && col < N) {
         real accumulator = 0;  
         for (int i = 0; i < K; i++) {
+            int A_index = (transposeA)? i + row*K : row + i*M;
             int B_index = (transposeB)? col + i*N : i + col*K;
-            real a = A[row + i * M];
+            real a = A[A_index];
             real b = B[B_index];
             accumulator += a * b;
         }
-        real C_term = (isVec) ? C[row] : C[row + col * M];
-        C[row + col * M] = alpha * accumulator + beta * C_term;
+        real add_term = 0.;
+        if (beta) {
+            real C_term = (isVec) ? C[row] : C[row + col * M];
+            add_term = beta * C_term;
+        }
+        C[row + col * M] = alpha * accumulator + add_term;
     }
 }
 
 __global__
 void smeMM(real* __restrict__ A, real* __restrict__ B,
            real* __restrict__ C, real alpha, real beta,
-           int M, int N, const int K, bool isVec, bool transposeB) {
+           int M, int N, const int K, 
+           bool isVec, bool transposeA, bool transposeB) {
 
     int blockRow = blockIdx.y * blockDim.y;
     int blockCol = blockIdx.x * blockDim.x;
@@ -60,7 +67,8 @@ void smeMM(real* __restrict__ A, real* __restrict__ B,
         __shared__ real A_block[BLOCK_SIZE * BLOCK_SIZE];
         __shared__ real B_block[BLOCK_SIZE * BLOCK_SIZE];
         if (gRow < M && i + col < K) {
-            A_block[row + col * BLOCK_SIZE] = A[gRow + (i + col) * M];
+            int gA_index = (transposeA)? (i + col) + gRow * K : gRow + (i + col) * M;
+            A_block[row + col * BLOCK_SIZE] = A[gA_index];
         }
         if (gCol < N && i + row < K) {
             int gB_index = (transposeB)? gCol + (i + row) * N : (i + row) + gCol * K;
@@ -77,8 +85,12 @@ void smeMM(real* __restrict__ A, real* __restrict__ B,
     }
 
     if (gRow < M && gCol < N) {
-        real C_term = (isVec) ? C[gRow] : C[gRow + gCol * M];
-        C[gRow + gCol * M] = alpha * accumulator + beta * C_term;
+        real add_term = 0.;
+        if (beta) {
+            real C_term = (isVec) ? C[gRow] : C[gRow + gCol * M];
+            add_term = beta * C_term;
+        }
+        C[gRow + gCol * M] = alpha * accumulator + add_term;
     }
 }
 
@@ -156,7 +168,7 @@ __device__ void reduce(volatile real *sdata, const int col) {
 }
 
 template <unsigned int blockSize>
-__global__ void sum(real* __restrict__ A, real* __restrict__ out, int K, int N) {
+__global__ void sum(real* __restrict__ A, real* __restrict__ out, real k, int K, int N) {
     extern __shared__ real sdata[];
 
     const int col = threadIdx.x;
@@ -179,7 +191,7 @@ __global__ void sum(real* __restrict__ A, real* __restrict__ out, int K, int N) 
 
     if (col < 32) reduce<blockSize>(sdata, col);
 
-    if (col == 0) out[row] = sdata[0];
+    if (col == 0) out[row] = k * sdata[0];
 }
 
 /***************************************************************
@@ -197,19 +209,47 @@ m, n, k
 */
 int myGEMM(real* __restrict__ A, real* __restrict__ B,
            real* __restrict__ C, real* alpha, real* beta,
-           int M, int N, int K, bool isVec, bool transposeB) {
+           int M, int N, int K, 
+           bool isVec, bool transposeA, bool transposeB) {
     dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
     dim3 blocks((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
     int algorithm = GLOBAL;
     switch (algorithm) {
         case GLOBAL:
-            globalMM<<<blocks, threads>>>(A, B, C, *alpha, *beta, M, N, K, isVec, transposeB);
+            globalMM<<<blocks, threads>>>(A, B, C, *alpha, *beta, M, N, K, isVec, transposeA, transposeB);
             break;
         case SMEM:
-            smeMM<<<blocks, threads>>>(A, B, C, *alpha, *beta, M, N, K, isVec, transposeB);
+            smeMM<<<blocks, threads>>>(A, B, C, *alpha, *beta, M, N, K, isVec, transposeA, transposeB);
             break;
       }
   return 0;
+}
+
+// without pointers to weights
+int myGEMM(real* __restrict__ A, real* __restrict__ B,
+           real* __restrict__ C, real alpha, real beta,
+           int M, int N, int K, 
+           bool isVec, bool transposeA, bool transposeB) {
+    dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 blocks((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    int algorithm = GLOBAL;
+    switch (algorithm) {
+        case GLOBAL:
+            globalMM<<<blocks, threads>>>(A, B, C, alpha, beta, M, N, K, isVec, transposeA, transposeB);
+            break;
+        case SMEM:
+            smeMM<<<blocks, threads>>>(A, B, C, alpha, beta, M, N, K, isVec, transposeA, transposeB);
+            break;
+      }
+  return 0;
+}
+
+int myGEMMAlloc(real* __restrict__ A, real* __restrict__ B,
+           real* __restrict__ C, real alpha, real beta,
+           int M, int N, int K, 
+           bool isVec, bool transposeA, bool transposeB) {
+    checkCudaErrors( cudaMalloc((void**) &C, M * N * sizeof(double)) );
+    return myGEMM(A, B, C, alpha, beta, M, N, K, isVec, transposeA, transposeB);
 }
 
 /*------------------ FORWARD PASS WRAPPERS ---------------------*/
@@ -254,20 +294,13 @@ real* deviceSoftmax(real* Z, int M, int N) {
 
 /*------------------ BACKWARD PASS WRAPPERS ---------------------*/
 
-real* deviceSubtract(real* A, real*B, real k, int M, int N) {
-    real* result;
-    checkCudaErrors(cudaMalloc(&result, sizeof(real) * M * N));
-
+void deviceSubtract(real* A, real*B, real k, int M, int N) {
     dim3 threadDims(32, 32);
     dim3 blockDims((M + threadDims.x - 1) / threadDims.x, (N + threadDims.y) / threadDims.y);
     subtract<<<blockDims, threadDims>>>(A, B, k, M, N);
-
-    checkCudaErrors(cudaMemcpy(result, B, sizeof(real) * M * N, cudaMemcpyDeviceToDevice));
-
-    return result;
 }
 
-void deviceSum(real* A, real* result, int K, int N) {
+void deviceSum(real* A, real* result, real k, int K, int N) {
 
     // batch_size cases: 800, 400, 267, 266, 200, 100
     dim3 gridDim(K);
@@ -280,39 +313,36 @@ void deviceSum(real* A, real* result, int K, int N) {
         threads = 512;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
-        sum<512><<<gridDim, blockDim, sharedMemSize>>>(A, result, K, N);
+        sum<512><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
     } else if (floor_N == 400) { 
         threads = 256;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
-        sum<256><<<gridDim, blockDim, sharedMemSize>>>(A, result, K, N);
+        sum<256><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
     } else if (floor_N == 266) {
         threads = 128;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
-        sum<128><<<gridDim, blockDim, sharedMemSize>>>(A, result, K, N);
+        sum<128><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
     } else if (floor_N == 100) {
         threads = 64;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
-        sum<64><<<gridDim, blockDim, sharedMemSize>>>(A, result, K, N);
+        sum<64><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
     } else {
         threads = 32;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
-        sum<32><<<gridDim, blockDim, sharedMemSize>>>(A, result, K, N);
+        sum<32><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
     }
 }
 
-real* deviceSigmoidBackward(real* S, real* A, int M, int N) {
-    real* result;
-    checkCudaErrors(cudaMalloc(&result, sizeof(real) * M * N));
-
+void deviceSigmoidBackward(real* S, real* A, int M, int N) {
     dim3 threadDims(32, 32);
     dim3 blockDims((M + threadDims.x - 1) / threadDims.x, (N + threadDims.y) / threadDims.y);
     sigmoidBackward<<<blockDims, threadDims>>>(S, A, M, N);
+}
 
-    checkCudaErrors(cudaMemcpy(result, A, sizeof(real) * M * N, cudaMemcpyDeviceToDevice));
-
-    return result;
+void deviceCleanUp(real* ptr) { 
+    checkCudaErrors(cudaFree(ptr)); 
 }

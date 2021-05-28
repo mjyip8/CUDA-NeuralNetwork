@@ -370,7 +370,7 @@ void TestKernels() {
   cudaMalloc(&result, sizeof(real) * 10);
 
   t1_gpu = high_resolution_clock::now();
-  deviceSum(dA, result, A.n_rows, A.n_cols);
+  deviceSum(dA, result, 1., A.n_rows, A.n_cols);
   t2_gpu = high_resolution_clock::now();
   time_span_gpu = duration_cast<duration<double>>(t2_gpu - t1_gpu); 
 

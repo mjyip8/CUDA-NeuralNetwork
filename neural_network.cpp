@@ -37,8 +37,8 @@ void initialize_grads(struct grads& grad, NeuralNetwork& nn) {
   grad.db.resize((size_t) nn.num_layers);
 
   for (int i = 0; i < nn.num_layers; ++i) {
-    grad.dW[i].set_size(arma::size(nn.W[i]));
-    grad.db[i].set_size(arma::size(nn.b[i]));
+    grad.dW[i] = arma::zeros<arma::Mat<real>>(arma::size(nn.W[i]));
+    grad.db[i] = arma::zeros<arma::Mat<real>>(arma::size(nn.b[i]));
   }
 }
 
@@ -113,7 +113,6 @@ void feedforward(NeuralNetwork& nn, const arma::Mat<real>& X,
   cache.z.resize(2);
   cache.a.resize(2);
 
-  // std::cout << W[0].n_rows << "\n";tw
   assert(X.n_rows == nn.W[0].n_cols);
   cache.X = X;
   int N = X.n_cols;
@@ -160,10 +159,10 @@ void parallel_feedforward(DeviceNeuralNetwork& nn, real* X,
  */
 void backprop(NeuralNetwork& nn, const arma::Mat<real>& y, real reg,
               const struct cache& bpcache, struct grads& bpgrads) {
-
+  bpgrads.dW.resize(2);
+  bpgrads.db.resize(2);
   int N = y.n_cols;
 
-  // std::cout << "backprop " << bpcache.yc << "\n";
   arma::Mat<real> diff = (1.0 / N) * (bpcache.yc - y);
   bpgrads.dW[1] = diff * bpcache.a[0].t() + reg * nn.W[1];
   bpgrads.db[1] = arma::sum(diff, 1);
@@ -216,7 +215,6 @@ real loss(NeuralNetwork& nn, const arma::Mat<real>& yc,
   real data_loss = ce_sum / N;
   real reg_loss = 0.5 * reg * norms(nn);
   real loss = data_loss + reg_loss;
-  // std::cout << "Loss: " << loss << "\n";
   return loss;
 }
 
@@ -347,6 +345,7 @@ void train(NeuralNetwork& nn, const arma::Mat<real>& X,
       iter++;
     }
   }
+  std::cout << "Exited train" << std::endl;
 }
 
 /*********************************************************************************
@@ -366,8 +365,7 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
   MPI_SAFE_CALL(MPI_Comm_size(MPI_COMM_WORLD, &num_procs));
   MPI_SAFE_CALL(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
 
-  int N = (rank == 0) ? X.n_cols : 0;
-  MPI_SAFE_CALL(MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD));
+  int N = X.n_cols;
 
   std::ofstream error_file;
   error_file.open("Outputs/CpuGpuDiff.txt");
@@ -378,6 +376,8 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
     int num_batches = (N + batch_size - 1) / batch_size;
 
     for (int batch = 0; batch < num_batches; ++batch) {
+
+      if (rank != 0) continue;
 
       // Device variables 
       DeviceNeuralNetwork dnn(nn.H);
@@ -390,9 +390,9 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
       arma::Mat<real> y_batch = y.cols(batch * batch_size, last_col);
 
       DeviceGrads grads(nn.H);
-      DeviceData data(X_batch.memptr(), y_batch.memptr(), X_batch.n_cols, X_batch.n_rows);
+      DeviceData data(X_batch.memptr(), y_batch.memptr(), X_batch.n_cols, X_batch.n_rows, y.n_rows);
       DeviceCache cache(nn.H, X_batch.n_cols, data.X);
-      real contribution = 1.;
+      real contrib = 1.;
 
       // 2. compute each sub-batch of images' contribution to network coefficient updates
       parallel_feedforward(dnn, data.X, cache);

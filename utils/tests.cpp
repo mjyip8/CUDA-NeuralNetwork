@@ -459,7 +459,7 @@ void TestForwardBackProp() {
   DeviceNeuralNetwork dnn(nn.H);
   dnn.CopyToDevice(nn.W, nn.b);
   DeviceGrads grads(nn.H);
-  DeviceData data(g_X_batch.memptr(), g_y_batch.memptr(), g_X_batch.n_cols, g_X_batch.n_rows);
+  DeviceData data(g_X_batch.memptr(), g_y_batch.memptr(), g_X_batch.n_cols, g_X_batch.n_rows, g_y_batch.n_rows);
   DeviceCache g_cache(nn.H, g_X_batch.n_cols, data.X);
   real contrib = 1.;
 

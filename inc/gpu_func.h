@@ -140,13 +140,13 @@ class DeviceData {
     int N;
     int K;
 
-    DeviceData(real* hX, real* hy, int _N, int _K) {
+    DeviceData(real* hX, real* hy, int _N, int _K, int numclasses) {
       N = _N;
       K = _K;
       checkCudaErrors(cudaMalloc(&X, sizeof(real) * N * K));
-      checkCudaErrors(cudaMalloc(&y, sizeof(real) * N * K));
-      checkCudaErrors(cudaMemcpy(X, hX, sizeof(real) * N * K, cudaMemcpyHostToDevice));   
-      checkCudaErrors(cudaMemcpy(y, hy, sizeof(real) * N * K, cudaMemcpyHostToDevice));
+      checkCudaErrors(cudaMalloc(&y, sizeof(real) * N * numclasses));
+      checkCudaErrors(cudaMemcpy(X, hX, sizeof(real) * N * K, cudaMemcpyHostToDevice));  
+      checkCudaErrors(cudaMemcpy(y, hy, sizeof(real) * N * numclasses, cudaMemcpyHostToDevice));
     }
 
     ~DeviceData() {

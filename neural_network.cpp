@@ -366,6 +366,7 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
   MPI_SAFE_CALL(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
 
   int N = X.n_cols;
+  MPI_BatchInfo bi(num_procs, batch_size, batch, N);
 
   std::ofstream error_file;
   error_file.open("Outputs/CpuGpuDiff.txt");
@@ -376,27 +377,37 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
     int num_batches = (N + batch_size - 1) / batch_size;
 
     for (int batch = 0; batch < num_batches; ++batch) {
+      // 0. Set up for MPI call
+      bi.batchUpdate(X, y, _batch);
+      
+      arma::Mat<real> batch_X, batch_y;
+      if (rank == 0) {
+        send_X = X.cols(bi.first_col, bi.last_col);
+        send_y = y.cols(bi.first_col, bi.last_col);
+      }
 
-      if (rank != 0) continue;
+      int minibatch_size = (rank < n_procs - 1) ? bi.minibatch_size : bi.last_batch_size; 
+      arma::Mat<real> minibatch_X = arma::zeros<arma::Mat<real>>(X.n_rows, minibatch_size);
+      arma::Mat<real> minibatch_y = arma::zeros<arma::Mat<real>>(y.n_rows, minibatch_size);
+
+      // 1. subdivide input batch of images and `MPI_scatter()' to each MPI node
+      MPI_SAFE_CALL(MPI_Scatterv(batch_X.memptr(), bi.send_counts_X, bi.displacements_X, MPI_FP, 
+                    minibatch_X.memptr(), minibatch_X.n_elems, MPI_FP, 0, MPI_COMM_WORLD));
+      MPI_SAFE_CALL(MPI_Scatterv(batch_y.memptr(), bi.send_counts_y, bi.displacements_y, MPI_FP, 
+                    minibatch_y.memptr(), minibatch_y.n_elems, MPI_FP, 0, MPI_COMM_WORLD));
 
       // Device variables 
       DeviceNeuralNetwork dnn(nn.H);
       dnn.CopyToDevice(nn.W, nn.b);
-
-      // 1. subdivide input batch of images and `MPI_scatter()' to each MPI node
-      // TODO MPI_Scatter
-      int last_col = std::min((batch + 1) * batch_size - 1, N - 1);
-      arma::Mat<real> X_batch = X.cols(batch * batch_size, last_col);
-      arma::Mat<real> y_batch = y.cols(batch * batch_size, last_col);
-
       DeviceGrads grads(nn.H);
-      DeviceData data(X_batch.memptr(), y_batch.memptr(), X_batch.n_cols, X_batch.n_rows, y.n_rows);
-      DeviceCache cache(nn.H, X_batch.n_cols, data.X);
-      real contrib = 1.;
+      DeviceData data(minibatch_X.memptr(), minibatch_y.memptr(), minibatch_X.n_cols, 
+                      minibatch_X.n_rows, minibatch_y.n_rows);
+      DeviceCache cache(nn.H, minibatch_X.n_cols, data.X);
+      real contrib = ((real) minibatch_X.n_cols) / ((real) bi.total_batch_size);
 
       // 2. compute each sub-batch of images' contribution to network coefficient updates
       parallel_feedforward(dnn, data.X, cache);
-      parallel_backprop(dnn, data.y, reg, cache, grads, 1.);
+      parallel_backprop(dnn, data.y, reg, cache, grads, contrib);
 
       // Copy gradients from device to host 
       struct grads bpgrads;
@@ -404,13 +415,36 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
       grads.CopyToHost(bpgrads.dW, bpgrads.db);
 
       // 3. reduce the coefficient updates and broadcast to all nodes with`MPI_Allreduce()
-      // TODO MPI_Allreduce
+      std::vector<arma::Mat<real>> dW(nn.W.size());
+      std::vector<arma::Col<real>> db(nn.W.size());
+
+      # pragma unroll
+      for (int i = 0; i < nn.W.size(); ++i) {
+        dW[i] = arma::zeros<arma::Mat<real>>(nn.H[i + 1], nn.H[i]);
+        db[i] = arma::zeros<arma::Col<real>>(nn.H[i + 1]);
+      }
+
+      MPI_Request reqs[nn.num_layers * 2];
+      # pragma unroll
+      for (int i = 0; i < nn.W.size(); ++i) {
+        MPI_SAFE_CALL(MPI_IAllReduce(bpgrads.dW[i].memptr(), dW[i].memptr(), 
+                      bpgrads.dW[i].n_elems, MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[i]));
+        MPI_SAFE_CALL(MPI_IAllReduce(bpgrads.db[i].memptr(), db[i].memptr(), 
+                      bpgrads.db[i].n_elems, MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[i + nn.num_layers])); 
+      }
+      MPI_Waitall(4, reqs, MPI_STATUSES_IGNORE);
 
       // 4. update local network coefficient at each node
-      for (int i = 0; i < nn.num_layers; ++i) {
-        nn.W[i] -= learning_rate * bpgrads.dW[i];
-        nn.b[i] -= learning_rate * bpgrads.db[i];
-      }
+      # pragma omp parallel num_threads(nn.num_layers * 2)
+      {
+        int i = omp_get_thread_num();
+        # pragma omp for nowait schedule(static)
+        if (i < nn.num_layers) {
+          nn.W[i] -= learning_rate * bpgrads.dW[i];
+        } else {
+          nn.b[i % nn.num_layers] -= learning_rate * bpgrads.db[i % nn.num_layers];
+        }
+      }  
 
       // +-*=+-*=+-*=+-*=+-*=+-*=+-*=+-*=+*-=+-*=+*-=+-*=+-*=+-*=+-*=+-*= //
       //                    POST-PROCESS OPTIONS                          //

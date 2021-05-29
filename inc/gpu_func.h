@@ -30,7 +30,7 @@ class DeviceNeuralNetwork {
     b.resize(num_layers);
     H = _H;
 
-    for (int i = 0; i < num_layers; i++) {
+    for (int i = 0; i < num_layers; ++i) {
       checkCudaErrors(cudaMalloc(&W[i], sizeof(real) * H[i + 1] * H[i]));
       checkCudaErrors(cudaMalloc(&b[i], sizeof(real) * H[i + 1] * H[i]));
     }
@@ -67,7 +67,7 @@ class DeviceGrads {
       db.resize((size_t) num_layers);
       checkCudaErrors(cudaMalloc(&dW[1], sizeof(real) * H[2] * H[1]));
 
-      for (int i = 0; i < num_layers; i++) {
+      for (int i = 0; i < num_layers; ++i) {
         checkCudaErrors(cudaMalloc(&db[i], sizeof(real) * H[i + 1]));
       }
     }
@@ -140,7 +140,7 @@ class DeviceData {
     int N;
     int K;
 
-    DeviceData(real* hX, real* hy, int _N, int _K, int numclasses) {
+    DeviceData(const real* hX, const real* hy, int _N, int _K, int numclasses) {
       N = _N;
       K = _K;
       checkCudaErrors(cudaMalloc(&X, sizeof(real) * N * K));

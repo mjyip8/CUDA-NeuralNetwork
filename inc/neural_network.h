@@ -2,6 +2,7 @@
 #define UTILS_TWO_LAYER_NET_H_
 
 #include <armadillo>
+#include <cassert>
 #include <cmath>
 #include <iostream>
 
@@ -39,64 +40,48 @@ class MPIBatchInfo {
     int N;
 
     // whole batch info
-    int batch;
-    int last_col;
-    int first_col;
     int total_batch_size;
-    int total_batch_elems_X;
-    int total_batch_elems_y;
-
-    // minibatch info
-    int minibatch_size;
-    int last_batch_size;
-    int minibatch_elems_X;
-    int minibatch_elems_y;
-    int* send_counts_X;
-    int* send_counts_y;
+    int first_col;
+    int last_col;
+    int* minibatch_sizes;
+    int* minibatch_sizes_X;
     int* displacements_X;
+    int* minibatch_sizes_y;
     int* displacements_y;
 
-
-    MPI_BatchInfo(int _num_procs, int _batch_size, _int batch, int _N) : 
-            num_procs(_num_procs), batch_size(_batch_size), batch(_batch), N(_N) {
-      send_counts_X = std::malloc(num_procs * sizeof(int));
-      send_counts_y = std::malloc(num_procs * sizeof(int));
-      displacements_X = std::calloc(num_procs, sizeof(int));
-      displacements_y = std::calloc(num_procs, sizeof(int));
+    MPIBatchInfo(int _num_procs, int _batch_size, int _N) : 
+            num_procs(_num_procs), batch_size(_batch_size), N(_N) {
+      minibatch_sizes = (int*) std::malloc(sizeof(int) * num_procs);
+      minibatch_sizes_X = (int*) std::malloc(sizeof(int) * num_procs);
+      displacements_X = (int*) std::malloc(sizeof(int) * num_procs);
+      minibatch_sizes_y = (int*) std::malloc(sizeof(int) * num_procs);
+      displacements_y = (int*) std::malloc(sizeof(int) * num_procs);
     }
 
-    batchUpdate(const arma::Mat<real>& X, const arma::Mat<real>& y, const int _batch) {
-      batch = _batch;
+    ~MPIBatchInfo() {
+      std::free(minibatch_sizes);
+      std::free(minibatch_sizes_X);
+      std::free(displacements_X);
+      std::free(minibatch_sizes_y);
+      std::free(displacements_y);
+    }
+
+    void batchUpdate(const arma::Mat<real>& X, const arma::Mat<real>& y, const int batch) {
       first_col = batch_size * batch;
       last_col = std::min((batch + 1) * batch_size - 1, N - 1);
-
       total_batch_size = last_col - first_col + 1;
-      total_batch_elems_X = total_batch_size * X.n_rows;
-      total_batch_elems_y = total_batch_size * y.n_rows;
-
-      minibatch_size = std::ceil((float) total_batch_size / (float) num_procs);
-      last_batch_size = (total_batch_size % num_procs)? total_batch_size % num_procs : minibatch_size;
-      minibatch_elems_X = minibatch_size * X.n_rows;
-      minibatch_elems_y = minibatch_size * y.n_rows;
-
-      std::memset(send_counts_X, minibatch_elems_X, (n_procs - 1) * sizeof(int));
-      send_counts_X[num_procs - 1] = last_batch_size * X.n_rows;
-
-      std::memset(send_counts_y, minibatch_elems_y, (n_procs - 1) * sizeof(int));
-      send_counts_y[num_procs - 1] = last_batch_size * y.n_rows;
+      int minibatch_size = (total_batch_size + num_procs - 1) / num_procs;
+      int last_batch_size = (total_batch_size % minibatch_size)? total_batch_size % minibatch_size : minibatch_size;
+      assert(total_batch_size == minibatch_size * (num_procs - 1) + last_batch_size);
 
       # pragma unroll
-      for (int i = 1; i < num_procs; i++) {
-        displacements_X[i] = i * minibatch_elems_X;
-        displacements_y[i] = i * minibatch_elems_y;
+      for (int i = 0; i < num_procs; ++i) {
+        minibatch_sizes[i] = (i < num_procs - 1) ? minibatch_size : last_batch_size;
+        displacements_X[i] = i * minibatch_sizes[i] * X.n_rows;
+        displacements_y[i] = i * minibatch_sizes[i] * y.n_rows;
+        minibatch_sizes_X[i] = minibatch_sizes[i] * X.n_rows;
+        minibatch_sizes_y[i] = minibatch_sizes[i] * y.n_rows;
       }
-    }
-
-    ~MPI_BatchInfo(arma::Mat<real> X_batch, arma::Mat<real> y_batch) {
-      std::free(send_counts_X);
-      std::free(send_counts_y);
-      std::free(displacements_X);
-      std::free(displacements_y);
     }
 };
 

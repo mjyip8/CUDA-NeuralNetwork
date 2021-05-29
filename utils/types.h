@@ -1,7 +1,7 @@
 #ifndef TYPES_H_
 #define TYPES_H_
 
-// #define USE_DOUBLE
+#define USE_DOUBLE
 
 #ifndef USE_DOUBLE
 

@@ -299,22 +299,22 @@ void deviceSum(real* A, real* result, real k, int K, int N) {
     size_t sharedMemSize;
 
     int floor_N = (N / 2) * 2;
-    if (floor_N == 800) {
+    if (floor_N > 512) {
         threads = 512;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
         sum<512><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
-    } else if (floor_N == 400) { 
+    } else if (floor_N <= 512 && floor_N > 256) { 
         threads = 256;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
         sum<256><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
-    } else if (floor_N == 266) {
+    } else if (floor_N <= 256 && floor_N > 128) {
         threads = 128;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
         sum<128><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
-    } else if (floor_N == 100) {
+    } else if (floor_N <= 128 && floor_N > 64) {
         threads = 64;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);

@@ -255,7 +255,6 @@ int main(int argc, char* argv[]) {
     std::cout << "Precision on validation set for sequential training = "
               << prec << std::endl;
   }
-
   /* Train the Neural Network in Parallel*/
   if (rank == 0) {
     std::cout << std::endl << "Start Parallel Training" << std::endl;

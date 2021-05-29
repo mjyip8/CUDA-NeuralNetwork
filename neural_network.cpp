@@ -57,6 +57,21 @@ void write_cpudata_tofile(NeuralNetwork& nn, int iter) {
   nn.b[1].save(v.str(), arma::raw_ascii);
 }
 
+void write_gpudata_tofile(NeuralNetwork& nn, int iter) {
+  std::stringstream s;
+  s << "Outputs/GPUmats/ParallelW0-" << iter << ".mat";
+  nn.W[0].save(s.str(), arma::raw_ascii);
+  std::stringstream t;
+  t << "Outputs/GPUmats/ParallelW1-" << iter << ".mat";
+  nn.W[1].save(t.str(), arma::raw_ascii);
+  std::stringstream u;
+  u << "Outputs/GPUmats/Parallelb0-" << iter << ".mat";
+  nn.b[0].save(u.str(), arma::raw_ascii);
+  std::stringstream v;
+  v << "Outputs/GPUmats/Parallelb1-" << iter << ".mat";
+  nn.b[1].save(v.str(), arma::raw_ascii);
+}
+
 void write_diff_gpu_cpu(NeuralNetwork& nn, int iter,
                         std::ofstream& error_file) {
   arma::Mat<real> A, B, C, D;
@@ -365,8 +380,16 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
   MPI_SAFE_CALL(MPI_Comm_size(MPI_COMM_WORLD, &num_procs));
   MPI_SAFE_CALL(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
 
-  int N = X.n_cols;
-  MPI_BatchInfo bi(num_procs, batch_size, batch, N);
+  int N = (rank == 0) ? X.n_cols : 0;
+  MPI_SAFE_CALL(MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD));
+
+  int img_size = (rank == 0) ? X.n_rows : 0;
+  MPI_SAFE_CALL(MPI_Bcast(&img_size, 1, MPI_INT, 0, MPI_COMM_WORLD));
+
+  int n_classes = (rank == 0) ? y.n_rows : 0;
+  MPI_SAFE_CALL(MPI_Bcast(&n_classes, 1, MPI_INT, 0, MPI_COMM_WORLD));
+
+  MPIBatchInfo bi(num_procs, batch_size, N);
 
   std::ofstream error_file;
   error_file.open("Outputs/CpuGpuDiff.txt");
@@ -377,33 +400,34 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
     int num_batches = (N + batch_size - 1) / batch_size;
 
     for (int batch = 0; batch < num_batches; ++batch) {
-      // 0. Set up for MPI call
-      bi.batchUpdate(X, y, _batch);
-      
-      arma::Mat<real> batch_X, batch_y;
+      int total_batch_size;
       if (rank == 0) {
-        send_X = X.cols(bi.first_col, bi.last_col);
-        send_y = y.cols(bi.first_col, bi.last_col);
+        bi.batchUpdate(X, y, batch);
+        total_batch_size = bi.total_batch_size;
       }
+      const real* batch_X = (rank == 0) ? X.colptr(bi.first_col) : nullptr;
+      const real* batch_y = (rank == 0) ? y.colptr(bi.first_col) : nullptr;
 
-      int minibatch_size = (rank < n_procs - 1) ? bi.minibatch_size : bi.last_batch_size; 
-      arma::Mat<real> minibatch_X = arma::zeros<arma::Mat<real>>(X.n_rows, minibatch_size);
-      arma::Mat<real> minibatch_y = arma::zeros<arma::Mat<real>>(y.n_rows, minibatch_size);
+      MPI_SAFE_CALL(MPI_Bcast(&total_batch_size, 1, MPI_INT, 0, MPI_COMM_WORLD));
+      int minibatch_size;
+      MPI_Scatter(bi.minibatch_sizes, 1, MPI_INT, &minibatch_size, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-      // 1. subdivide input batch of images and `MPI_scatter()' to each MPI node
-      MPI_SAFE_CALL(MPI_Scatterv(batch_X.memptr(), bi.send_counts_X, bi.displacements_X, MPI_FP, 
-                    minibatch_X.memptr(), minibatch_X.n_elems, MPI_FP, 0, MPI_COMM_WORLD));
-      MPI_SAFE_CALL(MPI_Scatterv(batch_y.memptr(), bi.send_counts_y, bi.displacements_y, MPI_FP, 
-                    minibatch_y.memptr(), minibatch_y.n_elems, MPI_FP, 0, MPI_COMM_WORLD));
+      arma::Mat<real> minibatch_X(minibatch_size, img_size);
+      arma::Mat<real> minibatch_y(minibatch_size, n_classes);
+      MPI_SAFE_CALL(MPI_Scatterv(batch_X, bi.minibatch_sizes_X, bi.displacements_X, 
+                    MPI_FP, minibatch_X.memptr(), minibatch_size * img_size, MPI_FP, 0, MPI_COMM_WORLD));
+
+      MPI_SAFE_CALL(MPI_Scatterv(batch_y, bi.minibatch_sizes_y, bi.displacements_y, 
+                    MPI_FP, minibatch_y.memptr(), minibatch_size * n_classes, MPI_FP, 0, MPI_COMM_WORLD));
 
       // Device variables 
       DeviceNeuralNetwork dnn(nn.H);
       dnn.CopyToDevice(nn.W, nn.b);
       DeviceGrads grads(nn.H);
-      DeviceData data(minibatch_X.memptr(), minibatch_y.memptr(), minibatch_X.n_cols, 
-                      minibatch_X.n_rows, minibatch_y.n_rows);
-      DeviceCache cache(nn.H, minibatch_X.n_cols, data.X);
-      real contrib = ((real) minibatch_X.n_cols) / ((real) bi.total_batch_size);
+      DeviceData data(minibatch_X.memptr(), minibatch_y.memptr(), minibatch_size, 
+                      img_size, n_classes);
+      DeviceCache cache(nn.H, minibatch_size, data.X);
+      real contrib = ((real) minibatch_size) / ((real) total_batch_size);
 
       // 2. compute each sub-batch of images' contribution to network coefficient updates
       parallel_feedforward(dnn, data.X, cache);
@@ -415,35 +439,30 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
       grads.CopyToHost(bpgrads.dW, bpgrads.db);
 
       // 3. reduce the coefficient updates and broadcast to all nodes with`MPI_Allreduce()
-      std::vector<arma::Mat<real>> dW(nn.W.size());
-      std::vector<arma::Col<real>> db(nn.W.size());
+      std::vector<arma::Mat<real>> dW(nn.num_layers);
+      std::vector<arma::Col<real>> db(nn.num_layers);
 
       # pragma unroll
-      for (int i = 0; i < nn.W.size(); ++i) {
+      for (int i = 0; i < nn.num_layers; ++i) {
         dW[i] = arma::zeros<arma::Mat<real>>(nn.H[i + 1], nn.H[i]);
         db[i] = arma::zeros<arma::Col<real>>(nn.H[i + 1]);
       }
 
       MPI_Request reqs[nn.num_layers * 2];
       # pragma unroll
-      for (int i = 0; i < nn.W.size(); ++i) {
-        MPI_SAFE_CALL(MPI_IAllReduce(bpgrads.dW[i].memptr(), dW[i].memptr(), 
-                      bpgrads.dW[i].n_elems, MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[i]));
-        MPI_SAFE_CALL(MPI_IAllReduce(bpgrads.db[i].memptr(), db[i].memptr(), 
-                      bpgrads.db[i].n_elems, MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[i + nn.num_layers])); 
+      for (int i = 0; i < nn.num_layers; ++i) {
+        MPI_SAFE_CALL(MPI_Iallreduce(bpgrads.dW[i].memptr(), dW[i].memptr(), 
+                      bpgrads.dW[i].n_elem, MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[i]));
+        MPI_SAFE_CALL(MPI_Iallreduce(bpgrads.db[i].memptr(), db[i].memptr(), 
+                      bpgrads.db[i].n_elem, MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[i + nn.num_layers])); 
       }
-      MPI_Waitall(4, reqs, MPI_STATUSES_IGNORE);
+      MPI_Waitall(num_procs, reqs, MPI_STATUSES_IGNORE);
 
       // 4. update local network coefficient at each node
-      # pragma omp parallel num_threads(nn.num_layers * 2)
-      {
-        int i = omp_get_thread_num();
-        # pragma omp for nowait schedule(static)
-        if (i < nn.num_layers) {
-          nn.W[i] -= learning_rate * bpgrads.dW[i];
-        } else {
-          nn.b[i % nn.num_layers] -= learning_rate * bpgrads.db[i % nn.num_layers];
-        }
+      # pragma unroll
+      for (int i = 0; i < nn.num_layers; ++i) {
+        nn.W[i] -= learning_rate * dW[i];
+        nn.b[i] -= learning_rate * db[i];     
       }  
 
       // +-*=+-*=+-*=+-*=+-*=+-*=+-*=+-*=+*-=+-*=+*-=+-*=+-*=+-*=+-*=+-*= //
@@ -457,6 +476,7 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
 
       if (debug && rank == 0 && print_flag) {
         write_diff_gpu_cpu(nn, iter, error_file);
+        write_gpudata_tofile(nn, iter);
       }
 
       iter++;

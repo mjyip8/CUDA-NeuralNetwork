@@ -53,4 +53,6 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
                     const int batch_size = 800, bool grad_check = false,
                     int print_every = -1, int debug = 0);
 
+void initialize_grads(struct grads& grad, NeuralNetwork& nn);
+
 #endif

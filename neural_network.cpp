@@ -32,6 +32,16 @@ real norms(NeuralNetwork& nn) {
   return norm_sum;
 }
 
+void initialize_grads(struct grads& grad, NeuralNetwork& nn) {
+  grad.dW.resize((size_t) nn.num_layers);
+  grad.db.resize((size_t) nn.num_layers);
+
+  for (int i = 0; i < nn.num_layers; ++i) {
+    grad.dW[i] = arma::zeros<arma::Mat<real>>(arma::size(nn.W[i]));
+    grad.db[i] = arma::zeros<arma::Mat<real>>(arma::size(nn.b[i]));
+  }
+}
+
 void write_cpudata_tofile(NeuralNetwork& nn, int iter) {
   std::stringstream s;
   s << "Outputs/CPUmats/SequentialW0-" << iter << ".mat";
@@ -103,7 +113,6 @@ void feedforward(NeuralNetwork& nn, const arma::Mat<real>& X,
   cache.z.resize(2);
   cache.a.resize(2);
 
-  // std::cout << W[0].n_rows << "\n";tw
   assert(X.n_rows == nn.W[0].n_cols);
   cache.X = X;
   int N = X.n_cols;
@@ -124,6 +133,23 @@ void feedforward(NeuralNetwork& nn, const arma::Mat<real>& X,
   cache.a[1] = cache.yc = a2;
 }
 
+void parallel_feedforward(DeviceNeuralNetwork& nn, real* X,
+                          DeviceCache& cache) {
+  int N = cache.N;
+  cache.LoadBias(nn.b);
+
+  myGEMM(nn.W[0], X, cache.z[0], 1., 1., nn.H[1], N, nn.H[0], true);
+
+  deviceSigmoid(cache.z[0], nn.H[1], N);
+  cache.recordAFromZ();
+
+  myGEMM(nn.W[1], cache.z[0], cache.z[1], 1., 1., nn.H[2], N, nn.H[1], true);
+
+  deviceSoftmax(cache.z[1], nn.H[2], N);
+
+  cache.yc = cache.z[1];
+}
+
 /*
  * Computes the gradients of the cost w.r.t each param.
  * MUST be called after feedforward since it uses the bpcache.
@@ -137,7 +163,6 @@ void backprop(NeuralNetwork& nn, const arma::Mat<real>& y, real reg,
   bpgrads.db.resize(2);
   int N = y.n_cols;
 
-  // std::cout << "backprop " << bpcache.yc << "\n";
   arma::Mat<real> diff = (1.0 / N) * (bpcache.yc - y);
   bpgrads.dW[1] = diff * bpcache.a[0].t() + reg * nn.W[1];
   bpgrads.db[1] = arma::sum(diff, 1);
@@ -147,6 +172,36 @@ void backprop(NeuralNetwork& nn, const arma::Mat<real>& y, real reg,
 
   bpgrads.dW[0] = dz1 * bpcache.X.t() + reg * nn.W[0];
   bpgrads.db[0] = arma::sum(dz1, 1);
+}
+
+void parallel_backprop(DeviceNeuralNetwork& nn, real* y, real reg,
+              DeviceCache& bpcache, DeviceGrads& bpgrads, real contrib) {
+  int N = bpcache.N;
+  bpgrads.LoadWeightMatrices(nn.W);
+
+  real* diff = y;   // reuse
+  deviceSubtract(bpcache.yc, diff, 1.0/N, nn.H[2], N);
+
+  myGEMM(diff, bpcache.a[0], bpgrads.dW[1], 
+          contrib, contrib * reg, nn.H[2], nn.H[1], N, 
+          false, false, true);
+
+  deviceSum(diff, bpgrads.db[1], contrib, nn.H[2], N);
+
+  real* da1; 
+  myGEMMAlloc(nn.W[1], diff, da1, 1., 0., nn.H[1], N, nn.H[2], 
+          false, true, false);
+
+  real* dz1 = da1; // reuse
+  deviceSigmoidBackward(bpcache.a[0], dz1, nn.H[1], N);
+
+  myGEMM(dz1, bpcache.X, bpgrads.dW[0], 
+          contrib, contrib * reg, nn.H[1], nn.H[0], N, 
+          false, false, true);
+
+  deviceSum(dz1, bpgrads.db[0], contrib, nn.H[1], N);
+
+  deviceCleanUp(dz1);
 }
 
 /*
@@ -160,7 +215,6 @@ real loss(NeuralNetwork& nn, const arma::Mat<real>& yc,
   real data_loss = ce_sum / N;
   real reg_loss = 0.5 * reg * norms(nn);
   real loss = data_loss + reg_loss;
-  // std::cout << "Loss: " << loss << "\n";
   return loss;
 }
 
@@ -291,7 +345,12 @@ void train(NeuralNetwork& nn, const arma::Mat<real>& X,
       iter++;
     }
   }
+  std::cout << "Exited train" << std::endl;
 }
+
+/*********************************************************************************
+ *                          PARALLEL IMPLEMENTATION
+ *********************************************************************************/
 
 /*
  * TODO
@@ -306,40 +365,52 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
   MPI_SAFE_CALL(MPI_Comm_size(MPI_COMM_WORLD, &num_procs));
   MPI_SAFE_CALL(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
 
-  int N = (rank == 0) ? X.n_cols : 0;
-  MPI_SAFE_CALL(MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD));
+  int N = X.n_cols;
 
   std::ofstream error_file;
   error_file.open("Outputs/CpuGpuDiff.txt");
   int print_flag = 0;
-
-  /* HINT: You can obtain a raw pointer to the memory used by Armadillo Matrices
-     for storing elements in a column major way. Or you can allocate your own
-     array memory space and store the elements in a row major way. Remember to
-     update the Armadillo matrices in NeuralNetwork &nn of rank 0 before
-     returning from the function. */
-
-  // TODO
-
-  /* iter is a variable used to manage debugging. It increments in the inner
-     loop and therefore goes from 0 to epochs*num_batches */
   int iter = 0;
 
   for (int epoch = 0; epoch < epochs; ++epoch) {
     int num_batches = (N + batch_size - 1) / batch_size;
 
     for (int batch = 0; batch < num_batches; ++batch) {
-      /*
-       * Possible implementation:
-       * 1. subdivide input batch of images and `MPI_scatter()' to each MPI node
-       * 2. compute each sub-batch of images' contribution to network
-       * coefficient updates
-       * 3. reduce the coefficient updates and broadcast to all nodes with
-       * `MPI_Allreduce()'
-       * 4. update local network coefficient at each node
-       */
 
-      // TODO
+      if (rank != 0) continue;
+
+      // Device variables 
+      DeviceNeuralNetwork dnn(nn.H);
+      dnn.CopyToDevice(nn.W, nn.b);
+
+      // 1. subdivide input batch of images and `MPI_scatter()' to each MPI node
+      // TODO MPI_Scatter
+      int last_col = std::min((batch + 1) * batch_size - 1, N - 1);
+      arma::Mat<real> X_batch = X.cols(batch * batch_size, last_col);
+      arma::Mat<real> y_batch = y.cols(batch * batch_size, last_col);
+
+      DeviceGrads grads(nn.H);
+      DeviceData data(X_batch.memptr(), y_batch.memptr(), X_batch.n_cols, X_batch.n_rows, y.n_rows);
+      DeviceCache cache(nn.H, X_batch.n_cols, data.X);
+      real contrib = 1.;
+
+      // 2. compute each sub-batch of images' contribution to network coefficient updates
+      parallel_feedforward(dnn, data.X, cache);
+      parallel_backprop(dnn, data.y, reg, cache, grads, 1.);
+
+      // Copy gradients from device to host 
+      struct grads bpgrads;
+      initialize_grads(bpgrads, nn);
+      grads.CopyToHost(bpgrads.dW, bpgrads.db);
+
+      // 3. reduce the coefficient updates and broadcast to all nodes with`MPI_Allreduce()
+      // TODO MPI_Allreduce
+
+      // 4. update local network coefficient at each node
+      for (int i = 0; i < nn.num_layers; ++i) {
+        nn.W[i] -= learning_rate * bpgrads.dW[i];
+        nn.b[i] -= learning_rate * bpgrads.db[i];
+      }
 
       // +-*=+-*=+-*=+-*=+-*=+-*=+-*=+-*=+*-=+-*=+*-=+-*=+-*=+-*=+-*=+-*= //
       //                    POST-PROCESS OPTIONS                          //
@@ -351,23 +422,11 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
       }
 
       if (debug && rank == 0 && print_flag) {
-        // TODO
-        // Copy data back to the CPU
-
-        /* The following debug routine assumes that you have already updated the
-         arma matrices in the NeuralNetwork nn.  */
         write_diff_gpu_cpu(nn, iter, error_file);
       }
 
       iter++;
     }
   }
-
-  // TODO
-  // Copy data back to the CPU
-
   error_file.close();
-
-  // TODO
-  // Free memory
 }

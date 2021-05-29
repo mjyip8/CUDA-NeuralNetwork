@@ -12,4 +12,8 @@ int checkNNErrors(NeuralNetwork& seq_nn, NeuralNetwork& par_nn,
 
 void BenchmarkGEMM();
 
+void TestKernels();
+
+void TestForwardBackProp();
+
 #endif

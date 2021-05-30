@@ -8,7 +8,13 @@
 
 #include "../utils/types.h"
 
+# define NUM_LAYERS 2
+
 void deviceCleanUp(real* ptr);
+
+real* deviceToDeviceCopy(real* orig, int size); 
+
+void setToZero(real*& ptr, int size);
 
 /***************************************************************
  *                     DEVICE CLASSES
@@ -26,18 +32,20 @@ class DeviceNeuralNetwork {
   std::vector<real *> b;
 
   DeviceNeuralNetwork(std::vector<int> _H) {
-    W.resize(num_layers);
-    b.resize(num_layers);
+    W.resize(NUM_LAYERS);
+    b.resize(NUM_LAYERS);
     H = _H;
 
-    for (int i = 0; i < num_layers; ++i) {
+    # pragma unroll
+    for (int i = 0; i < NUM_LAYERS; ++i) {
       checkCudaErrors(cudaMalloc(&W[i], sizeof(real) * H[i + 1] * H[i]));
-      checkCudaErrors(cudaMalloc(&b[i], sizeof(real) * H[i + 1] * H[i]));
+      checkCudaErrors(cudaMalloc(&b[i], sizeof(real) * H[i + 1]));
     }
   }
 
   ~DeviceNeuralNetwork() {
-    for (int i = 0; i < num_layers; ++i) {
+    # pragma unroll
+    for (int i = 0; i < NUM_LAYERS; ++i) {
       checkCudaErrors(cudaFree(W[i]));
       checkCudaErrors(cudaFree(b[i]));
     }
@@ -45,9 +53,19 @@ class DeviceNeuralNetwork {
 
   void CopyToDevice(std::vector<arma::Mat<real>>& hdW, 
                   std::vector<arma::Col<real>>& hdb) {
-    for (int i = 0; i < num_layers; ++i) {
+    # pragma unroll
+    for (int i = 0; i < NUM_LAYERS; ++i) {
       checkCudaErrors(cudaMemcpy(W[i], hdW[i].memptr(), sizeof(real) * H[i + 1] * H[i], cudaMemcpyHostToDevice));
-      checkCudaErrors(cudaMemcpy(b[i], hdb[i].memptr(), sizeof(real) * H[i + 1] * H[i], cudaMemcpyHostToDevice));
+      checkCudaErrors(cudaMemcpy(b[i], hdb[i].memptr(), sizeof(real) * H[i + 1], cudaMemcpyHostToDevice));
+    }
+  }
+
+  void CopyToHost(std::vector<arma::Mat<real>>& hW, 
+                  std::vector<arma::Col<real>>& hb) {
+    # pragma unroll
+    for (int i = 0; i < NUM_LAYERS; ++i) {
+      checkCudaErrors(cudaMemcpy(hW[i].memptr(), W[i], sizeof(real) * H[i + 1] * H[i], cudaMemcpyDeviceToHost));
+      checkCudaErrors(cudaMemcpy(hb[i].memptr(), b[i], sizeof(real) * H[i + 1], cudaMemcpyDeviceToHost));
     }
   }
 
@@ -59,35 +77,41 @@ class DeviceGrads {
     std::vector<real *> dW;
     std::vector<real *> db;
     std::vector<int> H;
+    real* dz;
+    int N;
 
-    DeviceGrads(std::vector<int> _H) {
+    DeviceGrads(std::vector<int> _H, const int _N) {
       H = _H;
+      N = _N;
 
-      dW.resize((size_t) num_layers);
-      db.resize((size_t) num_layers);
-      checkCudaErrors(cudaMalloc(&dW[1], sizeof(real) * H[2] * H[1]));
+      dW.resize((size_t) NUM_LAYERS);
+      db.resize((size_t) NUM_LAYERS);
 
-      for (int i = 0; i < num_layers; ++i) {
+      # pragma unroll
+      for (int i = 0; i < NUM_LAYERS; ++i) {
+        checkCudaErrors(cudaMalloc(&dW[i], sizeof(real) * H[i + 1] * H[i]));
         checkCudaErrors(cudaMalloc(&db[i], sizeof(real) * H[i + 1]));
       }
+      checkCudaErrors(cudaMalloc(&dz, sizeof(real) * H[1] * N));
     }
 
     ~DeviceGrads() {
-      for (int i = 0; i < num_layers; ++i) {
+      for (int i = 0; i < NUM_LAYERS; ++i) {
         checkCudaErrors(cudaFree(db[i]));
+        checkCudaErrors(cudaFree(dW[i]));
       }
-      cudaFree(dW[1]);
+      checkCudaErrors(cudaFree(dz));
     }
 
     void LoadWeightMatrices(std::vector<real *> W) {
-
-      dW[0] = W[0];
+      checkCudaErrors(cudaMemcpy(dW[0], W[0], sizeof(real) * H[1] * H[0], cudaMemcpyDeviceToDevice));
       checkCudaErrors(cudaMemcpy(dW[1], W[1], sizeof(real) * H[2] * H[1], cudaMemcpyDeviceToDevice));
     }
 
     void CopyToHost(std::vector<arma::Mat<real>>& hdW, 
                     std::vector<arma::Col<real>>& hdb) {
-      for (int i = 0; i < num_layers; ++i) {
+      # pragma unroll
+      for (int i = 0; i < NUM_LAYERS; ++i) {
         checkCudaErrors(cudaMemcpy(hdW[i].memptr(), dW[i], sizeof(real) * H[i + 1] * H[i], cudaMemcpyDeviceToHost));
         checkCudaErrors(cudaMemcpy(hdb[i].memptr(), db[i], sizeof(real) * H[i + 1], cudaMemcpyDeviceToHost));
       }
@@ -103,10 +127,9 @@ class DeviceCache {
     real* yc;
     std::vector<int> H;
 
-    DeviceCache(std::vector<int> _H, int _N, real* _X) {
+    DeviceCache(std::vector<int> _H, int _N) {
       H = _H;
-      N = _N;
-      X = _X; //copy of pointer to device X batch
+      N = _N; // upper estimate of minibatch size 
       z.resize(2);
       a.resize(1);
 
@@ -127,6 +150,7 @@ class DeviceCache {
     }
 
     void LoadBias(std::vector<real *>& b) {
+      # pragma unroll
       for (int i = 0; i < (int) z.size(); ++i) {
         checkCudaErrors(cudaMemcpy(z[i] + (N * H[i+1]), b[i], sizeof(real) * H[i + 1], cudaMemcpyDeviceToDevice));
       }
@@ -219,5 +243,7 @@ void deviceSubtract(real* A, real*B, real k, int M, int N);
 void deviceSum(real* A, real* result, real k, int K, int N);
 
 void deviceSigmoidBackward(real* S, real* A, int M, int N);
+
+void deviceUpdateParam(real* A, real*B, real lr, real contrib, int M, int N);
 
 #endif

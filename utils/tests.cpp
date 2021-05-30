@@ -458,9 +458,9 @@ void TestForwardBackProp() {
   arma::Mat<real> g_y_batch = y.cols(0, batch_size - 1);
   DeviceNeuralNetwork dnn(nn.H);
   dnn.CopyToDevice(nn.W, nn.b);
-  DeviceGrads grads(nn.H);
+  DeviceGrads grads(nn.H, NUM_TRAIN);
   DeviceData data(g_X_batch.memptr(), g_y_batch.memptr(), g_X_batch.n_cols, g_X_batch.n_rows, g_y_batch.n_rows);
-  DeviceCache g_cache(nn.H, g_X_batch.n_cols, data.X);
+  DeviceCache g_cache(nn.H, g_X_batch.n_cols);
   real contrib = 1.;
 
   // official forward prop
@@ -496,7 +496,7 @@ void TestForwardBackProp() {
   struct grads c_bpgrads;
   c_bpgrads.dW.resize(nn.num_layers);
   c_bpgrads.db.resize(nn.num_layers);
-  DeviceGrads bpgrads(nn.H);
+  DeviceGrads bpgrads(nn.H, N);
   bpgrads.LoadWeightMatrices(dnn.W);
 
   arma::Mat<real> c_diff = (1.0 / N) * (c_cache.yc - c_y_batch);
@@ -516,13 +516,14 @@ void TestForwardBackProp() {
   compareHostDeviceResults(bpgrads.db[1], c_bpgrads.db[1].memptr(), nn.H[2], 1, "db2 result");
 
   arma::Mat<real> c_da1 = nn.W[1].t() * c_diff;
-  real* da1; 
-  myGEMMAlloc(dnn.W[1], diff, da1, 1., 0., nn.H[1], N, nn.H[2], 
+
+  setToZero(bpgrads.dz, nn.H[1]*N);
+  myGEMM(dnn.W[1], diff, bpgrads.dz, 1., 0., nn.H[1], N, nn.H[2], 
           false, true, false);
-  compareHostDeviceResults(da1, c_da1.memptr(), nn.H[1], N, "DA1 result");
+  compareHostDeviceResults(bpgrads.dz, c_da1.memptr(), nn.H[1], N, "DA1 result");
 
   arma::Mat<real> c_dz1 = c_da1 % c_cache.a[0] % (1 - c_cache.a[0]);
-  real* dz1 = da1; // reuse
+  real* dz1 = bpgrads.dz; // reuse
   deviceSigmoidBackward(g_cache.a[0], dz1, nn.H[1], N);
   compareHostDeviceResults(dz1, c_dz1.memptr(), nn.H[1], N, "DZ1 result", true);
 
@@ -536,5 +537,16 @@ void TestForwardBackProp() {
   deviceSum(dz1, bpgrads.db[0], contrib, nn.H[1], N);
   compareHostDeviceResults(bpgrads.db[0], c_bpgrads.db[0].memptr(), nn.H[1], 1, "db2 result");
 
-  deviceCleanUp(dz1);
+  real lr = 0.1;
+  # pragma unroll
+  for (int i=0; i < nn.num_layers; i++) {
+    deviceUpdateParam(bpgrads.dW[i], dnn.W[i], lr, contrib, nn.H[i+1], nn.H[i]);
+    nn.W[i] -= lr * c_bpgrads.dW[i];
+    compareHostDeviceResults(dnn.W[i], nn.W[i].memptr(), nn.H[i + 1], nn.H[i], "Final nn W result");
+
+    deviceUpdateParam(bpgrads.db[i], dnn.b[i], lr, contrib, nn.H[i+1], 1);
+    nn.b[i] -= lr * c_bpgrads.db[i];
+    compareHostDeviceResults(dnn.b[i], nn.b[i].memptr(), nn.H[i + 1], 1, "Final nn b result");
+  }
+
 }

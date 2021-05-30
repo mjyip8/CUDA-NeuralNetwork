@@ -66,12 +66,10 @@ class MPIBatchInfo {
       std::free(displacements_y);
     }
 
-    void batchUpdate(const arma::Mat<real>& X, const arma::Mat<real>& y, const int batch) {
-      first_col = batch_size * batch;
-      last_col = std::min((batch + 1) * batch_size - 1, N - 1);
-      total_batch_size = last_col - first_col + 1;
+    void batchUpdate(const arma::Mat<real>& X, const arma::Mat<real>& y, const int total_batch_size) {
       int minibatch_size = (total_batch_size + num_procs - 1) / num_procs;
-      int last_batch_size = (total_batch_size % minibatch_size)? total_batch_size % minibatch_size : minibatch_size;
+      int last_batch_size = (total_batch_size % minibatch_size)? 
+                            total_batch_size % minibatch_size : minibatch_size;
       assert(total_batch_size == minibatch_size * (num_procs - 1) + last_batch_size);
 
       # pragma unroll
@@ -106,6 +104,7 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
                     const int batch_size = 800, bool grad_check = false,
                     int print_every = -1, int debug = 0);
 
-void initialize_grads(struct grads& grad, NeuralNetwork& nn);
+void initialize(std::vector<arma::Mat<real>>& W, 
+                      std::vector<arma::Col<real>>& b, NeuralNetwork& nn);
 
 #endif

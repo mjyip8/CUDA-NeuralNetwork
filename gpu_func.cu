@@ -148,6 +148,14 @@ void subtract(real* A, real*B, real k, int M, int N) {
 }
 
 __global__ 
+void updateParam(real* A, real*B, real lr, real contrib, int M, int N) {
+    const int row = blockDim.x * blockIdx.x + threadIdx.x;
+    const int col = blockDim.y * blockIdx.y + threadIdx.y;
+    if (row >= M || col >= N) return;
+    B[row + col * M] = contrib * (B[row + col * M] - lr * A[row + col * M]);
+}
+
+__global__ 
 void sigmoidBackward(real* S, real* A, int M, int N) {
     const int row = blockDim.x * blockIdx.x + threadIdx.x;
     const int col = blockDim.y * blockIdx.y + threadIdx.y;
@@ -232,7 +240,7 @@ int myGEMM(real* __restrict__ A, real* __restrict__ B,
            bool isVec, bool transposeA, bool transposeB) {
     dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
     dim3 blocks((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
-    int algorithm = SMEM;
+    int algorithm = GLOBAL;
     switch (algorithm) {
         case GLOBAL:
             globalMM<<<blocks, threads>>>(A, B, C, alpha, beta, M, N, K, isVec, transposeA, transposeB);
@@ -248,8 +256,6 @@ int myGEMMAlloc(real* __restrict__ A, real* __restrict__ B,
            real*& C, real alpha, real beta,
            int M, int N, int K, 
            bool isVec, bool transposeA, bool transposeB) {
-    checkCudaErrors(cudaMalloc(&C, sizeof(real) * M * N));
-    checkCudaErrors(cudaMemset(C, 0, sizeof(real)));
     return myGEMM(A, B, C, alpha, beta, M, N, K, isVec, transposeA, transposeB);
 }
 
@@ -333,6 +339,23 @@ void deviceSigmoidBackward(real* S, real* A, int M, int N) {
     sigmoidBackward<<<blockDims, threadDims>>>(S, A, M, N);
 }
 
+void deviceUpdateParam(real* A, real*B, real lr, real contrib, int M, int N) {
+    dim3 threadDims(32, 32);
+    dim3 blockDims((M + threadDims.x - 1) / threadDims.x, (N + threadDims.y) / threadDims.y);
+    updateParam<<<blockDims, threadDims>>>(A, B, lr, contrib, M, N);
+}
+
+void setToZero(real*& ptr, int size) {
+    checkCudaErrors(cudaMemset(ptr, 0, sizeof(real) * size));
+}
+
 void deviceCleanUp(real* ptr) { 
     checkCudaErrors(cudaFree(ptr)); 
+}
+
+real* deviceToDeviceCopy(real* orig, int size) {
+  real* ptr = nullptr;
+  checkCudaErrors(cudaMalloc(&ptr, sizeof(real) * size));
+  checkCudaErrors(cudaMemcpy(ptr, orig, sizeof(real) * size, cudaMemcpyDeviceToDevice));
+  return ptr;
 }

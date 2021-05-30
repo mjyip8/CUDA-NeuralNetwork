@@ -38,8 +38,11 @@ cd $SLURM_SUBMIT_DIR
 # ./main -g 5
 # ./main -g 6
 # echo "mpirun -np 3 ./main -g 3"
-# time mpirun -np 3 ./main -g 3
+time mpirun -np 2 ./main -g 3
 
+# mpirun -np 4 nsys profile --trace=cuda,mpi --output="NSYS/global_mpi.qdrep" ./main -g 3
+
+# ncu -o ncompute ./main -g 1 -e 1
 # Comment out to run the rest
 exit 0
 

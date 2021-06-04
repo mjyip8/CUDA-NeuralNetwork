@@ -165,24 +165,6 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
-  if (grade == 5) {
-    if (rank == 0) {
-      TestKernels();
-    }
-
-    MPI_Finalize();
-    return 0;
-  }
-
-  if (grade == 6) {
-    if (rank == 0) {
-      TestForwardBackProp();
-    }
-
-    MPI_Finalize();
-    return 0;
-  }
-
   H[0] = IMAGE_SIZE;
   H[1] = num_neuron;
   H[2] = NUM_CLASSES;
@@ -255,6 +237,7 @@ int main(int argc, char* argv[]) {
     std::cout << "Precision on validation set for sequential training = "
               << prec << std::endl;
   }
+
   /* Train the Neural Network in Parallel*/
   if (rank == 0) {
     std::cout << std::endl << "Start Parallel Training" << std::endl;

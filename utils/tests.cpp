@@ -3,27 +3,15 @@
 #include <chrono>
 #include <fstream>
 #include <iomanip>
-#include <armadillo>
 
 #include "cublas_v2.h"
 #include "gpu_func.h"
 #include "mpi.h"
-#include "mnist.h"
 #include "types.h"
-#include "common.h"
 using namespace std;
 
 #define SCALE 1       // Factor to SCALE the GEMM problem size by
 #define NUM_ITERS 10  // Number of GEMMs run for timing purposes
-
-#define FILE_TRAIN_IMAGES "/data/train-images-idx3-ubyte"
-#define FILE_TRAIN_LABELS "/data/train-labels-idx1-ubyte"
-#define FILE_TEST_IMAGES "/data/t10k-images-idx3-ubyte"
-#define FILE_TEST_OUTPUT "Outputs/Pred_testset.txt"
-#define NUM_TRAIN 60000
-#define IMAGE_SIZE 784  // 28 x 28
-#define NUM_CLASSES 10
-#define NUM_TEST 10000
 
 #ifdef USE_DOUBLE
 #define TOL 1e-12  // Tolerance for tests
@@ -118,7 +106,7 @@ void createMATS(real* A, real* B, real* C1, real* C2, int NI, int NJ, int NK) {
   }
 }
 
-int compareGEMMResults(real* myC, real* refC, int NI, int NJ, bool print=false) {
+int compareGEMMResults(real* myC, real* refC, int NI, int NJ) {
   int i, j;
   int fail = 0;
 
@@ -135,25 +123,12 @@ int compareGEMMResults(real* myC, real* refC, int NI, int NJ, bool print=false) 
   if (fail) {
     std::cout << "My GEMM output not matching with reference. Rel diff = "
               << reldiff << std::endl;
-    if (print) {
-      mysol.save("Tests/mySol.mat", arma::raw_ascii);
-      refsol.save("Tests/refSol.mat", arma::raw_ascii);
-    }
   } else {
     std::cout << "GEMM matched with reference successfully! Rel diff = "
               << reldiff << std::endl;
   }
 
   return fail;
-}
-
-int compareHostDeviceResults(real* device, real* host, int NI, int NJ, std::string name = "", bool print=false) {
-  if (!name.empty()) {
-      std::cout << "\n************"<< name << "************" << std::endl;
-  }
-  arma::Mat<real> hostCopy = arma::zeros<arma::Mat<real>>(NI, NJ);
-  cudaMemcpy(hostCopy.memptr(), device, sizeof(real) * NI * NJ, cudaMemcpyDeviceToHost);
-  return compareGEMMResults(hostCopy.memptr(), host, NI, NJ, print);
 }
 
 void TestGEMM(int M, int N, int K) {
@@ -292,261 +267,4 @@ void BenchmarkGEMM() {
             << "M = " << M << "; N = " << N << "; K = " << K << std::endl;
   TestGEMM(M, N, K);
   std::cout << "Completed GEMM 2" << std::endl;
-}
-
-void print_mat(arma::Mat<real> my_matrix) {
-    
-    uint cols = my_matrix.n_cols;
-    uint rows = my_matrix.n_rows;
-    
-    std::cout << "--------\n";
-    for(uint rX = 0; rX < rows; rX++) {
-        std::cout << " " << rX << ": ";
-        for(uint cX = 0; cX < cols; cX++) {
-            std::cout << my_matrix(rX, cX) << " ";
-        }
-        std::cout << "\n";
-    }
-    std::cout << "--------\n";
-}
-
-void TestKernels() {
-  using namespace std::chrono;
-  int test_batch_size = 267;
-  /* softmax test */
-  std::cout << "\n************Softmax Kernel************" << std::endl;
-  arma::Mat<real> A(10, test_batch_size);
-  arma::Mat<real> A_result(10, test_batch_size);
-  A.randu();
-  A *= 10.;
-  real* result;
-
-  high_resolution_clock::time_point t1_cpu = high_resolution_clock::now();
-  softmax(A, A_result);
-  high_resolution_clock::time_point t2_cpu = high_resolution_clock::now();
-  duration<double> time_span_cpu = duration_cast<duration<double>>(t2_cpu - t1_cpu);
-
-  real* dA;
-  arma::Mat<real> dA_result(10, test_batch_size);
-  cudaMalloc(&dA, sizeof(real) * A.n_elem);
-  cudaMemcpy(dA, A.memptr(), sizeof(real) * A.n_elem, cudaMemcpyHostToDevice);
-  high_resolution_clock::time_point t1_gpu = high_resolution_clock::now();
-  deviceSoftmax(dA, A.n_rows, A.n_cols);
-  high_resolution_clock::time_point t2_gpu = high_resolution_clock::now();
-  duration<double> time_span_gpu = duration_cast<duration<double>>(t2_gpu - t1_gpu); 
-
-  cudaMemcpy(dA_result.memptr(), result, sizeof(real) * A.n_elem, cudaMemcpyDeviceToHost);
-  cudaFree(dA);
-
-  int fail = compareGEMMResults(dA_result.memptr(), A_result.memptr(), A.n_rows, A.n_cols);
-  if (fail == 0) {
-    std::cout << "Time for CPU Softmax implementation: "
-              << time_span_cpu.count() << " seconds" << std::endl;
-    std::cout << "Time for GPU Softmax implementation: " << time_span_gpu.count()
-              << " seconds" << std::endl;
-  }
-
-  /* sigmoid test */
-  std::cout << "\n************Sigmoid Kernel************" << std::endl;
-  A.randu();
-  A *= 10.;
-  t1_cpu = high_resolution_clock::now();
-  sigmoid(A, A_result);
-  t2_cpu = high_resolution_clock::now();
-  time_span_cpu = duration_cast<duration<double>>(t2_cpu - t1_cpu);
-
-  cudaMalloc(&dA, sizeof(real) * A.n_elem);
-  cudaMemcpy(dA, A.memptr(), sizeof(real) * A.n_elem, cudaMemcpyHostToDevice);
-
-  t1_gpu = high_resolution_clock::now();
-  deviceSigmoid(dA, A.n_rows, A.n_cols);
-  t2_gpu = high_resolution_clock::now();
-  time_span_gpu = duration_cast<duration<double>>(t2_gpu - t1_gpu); 
-
-  cudaMemcpy(dA_result.memptr(), dA, sizeof(real) * A.n_elem, cudaMemcpyDeviceToHost);
-  cudaFree(dA);
-
-  fail = compareGEMMResults(dA_result.memptr(), A_result.memptr(), A.n_rows, A.n_cols);
-  if (fail == 0) {
-    std::cout << "Time for CPU Sigmoid implementation: "
-              << time_span_cpu.count() << " seconds" << std::endl;
-    std::cout << "Time for GPU Sigmoid implementation: " << time_span_gpu.count()
-              << " seconds" << std::endl;
-  } else {
-    A_result.save("Outputs/CPUmats/CPUsigmoid.mat", arma::raw_ascii);
-    dA_result.save("Outputs/GPUmats/GPUsigmoid.mat", arma::raw_ascii);
-  }
-
-  /* sum reduction test */
-  std::cout << "\n************Sum Reduction Kernel************" << std::endl;
-  A.randu();
-  A *= 10.;
-  t1_cpu = high_resolution_clock::now();
-  arma::Mat<real> A_sum = arma::sum(A, 1);
-  t2_cpu = high_resolution_clock::now();
-  time_span_cpu = duration_cast<duration<double>>(t2_cpu - t1_cpu);
-
-  cudaMalloc(&dA, sizeof(real) * A.n_elem);
-  cudaMemcpy(dA, A.memptr(), sizeof(real) * A.n_elem, cudaMemcpyHostToDevice);
-  cudaMalloc(&result, sizeof(real) * 10);
-
-  t1_gpu = high_resolution_clock::now();
-  deviceSum(dA, result, 1., A.n_rows, A.n_cols);
-  t2_gpu = high_resolution_clock::now();
-  time_span_gpu = duration_cast<duration<double>>(t2_gpu - t1_gpu); 
-
-  arma::Mat<real> dA_sum(10, 1);
-  cudaMemcpy(dA_sum.memptr(), result, sizeof(real) * dA_sum.n_elem, cudaMemcpyDeviceToHost);
-  cudaFree(dA);
-  cudaFree(result);
-
-  fail = compareGEMMResults(dA_sum.memptr(), A_sum.memptr(), A_sum.n_rows, A_sum.n_cols);
-  if (fail == 0) {
-    std::cout << "Time for CPU Sum implementation: "
-              << time_span_cpu.count() << " seconds" << std::endl;
-    std::cout << "Time for GPU deviceSum implementation: " << time_span_gpu.count()
-              << " seconds" << std::endl;
-  } else {
-    A_sum.save("Outputs/CPUmats/CPUsum.mat", arma::raw_ascii);
-    dA_sum.save("Outputs/GPUmats/GPUsum.mat", arma::raw_ascii);
-  }
-}
-
-void TestForwardBackProp() {
-  /* SETUP */
-  std::vector<int> H(3);
-  real reg = 1e-4;
-  real learning_rate = 0.001;
-  int num_epochs = 20;
-  int batch_size = 100;
-  int num_neuron = 1000;
-  int run_seq = 0;
-  int debug = 0;
-  int grade = 0;
-  int print_every = 0;
-
-  H[0] = IMAGE_SIZE;
-  H[1] = num_neuron;
-  H[2] = NUM_CLASSES;
-
-  arma::Mat<real> x_train, y_train, label_train, x_dev, y_dev, label_dev,
-      x_test;
-  NeuralNetwork nn(H);
-  // Read MNIST images into Armadillo mat vector
-  arma::Mat<real> x(IMAGE_SIZE, NUM_TRAIN);
-  // label contains the prediction for each
-  arma::Row<real> label = arma::zeros<arma::Row<real>>(NUM_TRAIN);
-  // y is the matrix of one-hot label vectors where only y[c] = 1,
-  // where c is the right class.
-  arma::Mat<real> y = arma::zeros<arma::Mat<real>>(NUM_CLASSES, NUM_TRAIN);
-
-  std::cout << "Loading training data..." << std::endl;
-  read_mnist(FILE_TRAIN_IMAGES, x);
-  read_mnist_label(FILE_TRAIN_LABELS, label);
-  label_to_y(label, NUM_CLASSES, y);
-
-  /* FORWARD PROP */
-  // set up for forward prop
-  arma::Mat<real> c_X_batch = x.cols(0, batch_size - 1);
-  arma::Mat<real> c_y_batch = y.cols(0, batch_size - 1);
-  struct cache c_cache;
-  c_cache.z.resize(2);
-  c_cache.a.resize(2);
-  c_cache.X = c_X_batch;
-
-  arma::Mat<real> g_X_batch = x.cols(0, batch_size - 1);
-  arma::Mat<real> g_y_batch = y.cols(0, batch_size - 1);
-  DeviceNeuralNetwork dnn(nn.H);
-  dnn.CopyToDevice(nn.W, nn.b);
-  DeviceGrads grads(nn.H, NUM_TRAIN);
-  DeviceData data(g_X_batch.memptr(), g_y_batch.memptr(), g_X_batch.n_cols, g_X_batch.n_rows, g_y_batch.n_rows);
-  DeviceCache g_cache(nn.H, g_X_batch.n_cols);
-  real contrib = 1.;
-
-  // official forward prop
-  int N = c_X_batch.n_cols;
-  g_cache.LoadBias(dnn.b);
-
-  arma::Mat<real> z1 = nn.W[0] * c_X_batch+ arma::repmat(nn.b[0], 1, N);
-  c_cache.z[0] = z1;
-
-  myGEMM(dnn.W[0], data.X, g_cache.z[0], 1., 1., dnn.H[1], N, dnn.H[0], true);
-  compareHostDeviceResults(g_cache.z[0], z1.memptr(), nn.H[1], N, "Linear Layer 1");
-
-  arma::Mat<real> a1;
-  sigmoid(z1, a1);
-  c_cache.a[0] = a1;
-  deviceSigmoid(g_cache.z[0], dnn.H[1], N);
-  g_cache.recordAFromZ();
-  compareHostDeviceResults(g_cache.a[0], a1.memptr(), nn.H[1], N, "Sigmoid Activation");
-
-  arma::Mat<real> z2 = nn.W[1] * a1 + arma::repmat(nn.b[1], 1, N);
-  c_cache.z[1] = z2;
-  myGEMM(dnn.W[1], g_cache.a[0], g_cache.z[1], 1., 1., dnn.H[2], N, dnn.H[1], true);
-  compareHostDeviceResults(g_cache.z[1], z2.memptr(), nn.H[2], N, "Linear Layer 2");
-
-  arma::Mat<real> a2;
-  softmax(z2, a2);
-  c_cache.a[1] = c_cache.yc = a2;
-  deviceSoftmax(g_cache.z[1], dnn.H[2], N);
-  g_cache.yc = g_cache.z[1];
-  compareHostDeviceResults(g_cache.yc, a2.memptr(), nn.H[2], N, "Softmax Layer");
-
-  std::cout << "______________________BACKWARD PROP______________________\n";
-  struct grads c_bpgrads;
-  c_bpgrads.dW.resize(nn.num_layers);
-  c_bpgrads.db.resize(nn.num_layers);
-  DeviceGrads bpgrads(nn.H, N);
-  bpgrads.LoadWeightMatrices(dnn.W);
-
-  arma::Mat<real> c_diff = (1.0 / N) * (c_cache.yc - c_y_batch);
-  real* diff = data.y;   // reuse
-  deviceSubtract(g_cache.yc, diff, 1.0/N, nn.H[2], N);
-  compareHostDeviceResults(diff, c_diff.memptr(), nn.H[2], N, "Reverse Loss + Softmax");
-
-  c_bpgrads.dW[1] = c_diff * c_cache.a[0].t() + reg * nn.W[1];
-
-  myGEMM(diff, g_cache.a[0], bpgrads.dW[1], 
-          contrib, contrib * reg, nn.H[2], nn.H[1], N, 
-          false, false, true);
-  compareHostDeviceResults(bpgrads.dW[1], c_bpgrads.dW[1].memptr(), nn.H[2], nn.H[1], "dW2 result");
-
-  c_bpgrads.db[1] = arma::sum(c_diff, 1);
-  deviceSum(diff, bpgrads.db[1], contrib, nn.H[2], N);
-  compareHostDeviceResults(bpgrads.db[1], c_bpgrads.db[1].memptr(), nn.H[2], 1, "db2 result");
-
-  arma::Mat<real> c_da1 = nn.W[1].t() * c_diff;
-
-  setToZero(bpgrads.dz, nn.H[1]*N);
-  myGEMM(dnn.W[1], diff, bpgrads.dz, 1., 0., nn.H[1], N, nn.H[2], 
-          false, true, false);
-  compareHostDeviceResults(bpgrads.dz, c_da1.memptr(), nn.H[1], N, "DA1 result");
-
-  arma::Mat<real> c_dz1 = c_da1 % c_cache.a[0] % (1 - c_cache.a[0]);
-  real* dz1 = bpgrads.dz; // reuse
-  deviceSigmoidBackward(g_cache.a[0], dz1, nn.H[1], N);
-  compareHostDeviceResults(dz1, c_dz1.memptr(), nn.H[1], N, "DZ1 result", true);
-
-  c_bpgrads.dW[0] = c_dz1 * c_cache.X.t() + reg * nn.W[0];
-  myGEMM(dz1, g_cache.X, bpgrads.dW[0], 
-          contrib, contrib * reg, nn.H[1], nn.H[0], N, 
-          false, false, true);
-  compareHostDeviceResults(bpgrads.dW[0], c_bpgrads.dW[0].memptr(), nn.H[1], nn.H[0], "dW2 result");
-
-  c_bpgrads.db[0] = arma::sum(c_dz1, 1);
-  deviceSum(dz1, bpgrads.db[0], contrib, nn.H[1], N);
-  compareHostDeviceResults(bpgrads.db[0], c_bpgrads.db[0].memptr(), nn.H[1], 1, "db2 result");
-
-  real lr = 0.1;
-  # pragma unroll
-  for (int i=0; i < nn.num_layers; i++) {
-    deviceUpdateParam(bpgrads.dW[i], dnn.W[i], lr, contrib, nn.H[i+1], nn.H[i]);
-    nn.W[i] -= lr * c_bpgrads.dW[i];
-    compareHostDeviceResults(dnn.W[i], nn.W[i].memptr(), nn.H[i + 1], nn.H[i], "Final nn W result");
-
-    deviceUpdateParam(bpgrads.db[i], dnn.b[i], lr, contrib, nn.H[i+1], 1);
-    nn.b[i] -= lr * c_bpgrads.db[i];
-    compareHostDeviceResults(dnn.b[i], nn.b[i].memptr(), nn.H[i + 1], 1, "Final nn b result");
-  }
-
 }

@@ -148,11 +148,11 @@ void subtract(real* A, real*B, real k, int M, int N) {
 }
 
 __global__ 
-void updateParam(real* A, real*B, real lr, real contrib, int M, int N) {
+void updateParam(real* A, real*B, real lr, int M, int N) {
     const int row = blockDim.x * blockIdx.x + threadIdx.x;
     const int col = blockDim.y * blockIdx.y + threadIdx.y;
     if (row >= M || col >= N) return;
-    B[row + col * M] = contrib * (B[row + col * M] - lr * A[row + col * M]);
+    B[row + col * M] = B[row + col * M] - (lr * A[row + col * M]);
 }
 
 __global__ 
@@ -252,26 +252,7 @@ int myGEMM(real* __restrict__ A, real* __restrict__ B,
   return 0;
 }
 
-int myGEMMAlloc(real* __restrict__ A, real* __restrict__ B,
-           real*& C, real alpha, real beta,
-           int M, int N, int K, 
-           bool isVec, bool transposeA, bool transposeB) {
-    return myGEMM(A, B, C, alpha, beta, M, N, K, isVec, transposeA, transposeB);
-}
-
 /*------------------ FORWARD PASS WRAPPERS ---------------------*/
-
-real* deviceLinear(real* A, real* B, real* C, real* alpha, real* beta, int M, int N,
-           int K, bool isVec, bool transposeB) {
-    real* result;
-    checkCudaErrors(cudaMalloc(&result, sizeof(real) * M * N));
-
-    myGEMM(A, B, C, alpha, beta, M, N, K, isVec, transposeB);
-
-    checkCudaErrors(cudaMemcpy(result, C, sizeof(real) * M * N, cudaMemcpyDeviceToDevice));
-
-    return result;
-}
 
 void deviceSigmoid(real* Z, int M, int N) {
     real* result;
@@ -339,11 +320,13 @@ void deviceSigmoidBackward(real* S, real* A, int M, int N) {
     sigmoidBackward<<<blockDims, threadDims>>>(S, A, M, N);
 }
 
-void deviceUpdateParam(real* A, real*B, real lr, real contrib, int M, int N) {
+void deviceUpdateParam(real* A, real*B, real lr, int M, int N) {
     dim3 threadDims(32, 32);
     dim3 blockDims((M + threadDims.x - 1) / threadDims.x, (N + threadDims.y) / threadDims.y);
-    updateParam<<<blockDims, threadDims>>>(A, B, lr, contrib, M, N);
+    updateParam<<<blockDims, threadDims>>>(A, B, lr, M, N);
 }
+
+/*------------------ HELPER FUNCTIONS ---------------------*/
 
 void setToZero(real*& ptr, int size) {
     checkCudaErrors(cudaMemset(ptr, 0, sizeof(real) * size));
@@ -351,6 +334,10 @@ void setToZero(real*& ptr, int size) {
 
 void deviceCleanUp(real* ptr) { 
     checkCudaErrors(cudaFree(ptr)); 
+}
+
+void deviceMalloc(real*& ptr, int size) {
+  checkCudaErrors(cudaMalloc(&ptr, sizeof(real) * size));
 }
 
 real* deviceToDeviceCopy(real* orig, int size) {

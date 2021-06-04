@@ -35,24 +35,16 @@ cd $SLURM_SUBMIT_DIR
 # Grading mode 4
 # echo "./main -g 4"
 # ./main -g 4
-# ./main -g 5
-# ./main -g 6
-# echo "mpirun -np 3 ./main -g 3"
-time mpirun -np 2 ./main -g 3
 
-# mpirun -np 4 nsys profile --trace=cuda,mpi --output="NSYS/global_mpi.qdrep" ./main -g 3
-
-# ncu -o ncompute ./main -g 1 -e 1
 # Comment out to run the rest
 exit 0
 
 # Loop through grading modes 1, 2, and 3
 # Errors are outputted in the directories Outputs_{1,2,3}
-# for mode in 1 2 3
 for mode in 1 2 3
 do
-    echo "mpirun -np 2 ./main -g ${mode}"
-    time mpirun -np 2 ./main -g ${mode}
+    echo "mpirun -np 4 ./main -g ${mode}"
+    time mpirun -np 4 ./main -g ${mode}
     if [ -d Outputs_${mode} ]
     then
         rm -r Outputs_${mode}

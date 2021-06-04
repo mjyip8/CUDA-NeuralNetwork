@@ -12,6 +12,9 @@
 #include "mpi.h"
 #include "utils/common.h"
 
+typedef std::vector<arma::Mat<real>> MatVec;
+typedef std::vector<arma::Col<real>> ColVec;
+
 #define MPI_SAFE_CALL(call)                                                  \
   do {                                                                       \
     int err = call;                                                          \
@@ -22,6 +25,90 @@
     }                                                                        \
   } while (0)
 
+/***************************************************************
+ *                     HOST CLASSES
+ ***************************************************************/
+class HostData {
+  public:
+    // MatVec X;
+    // MatVec y;
+    arma::Mat<real> X;
+    arma::Mat<real> y;
+    MatVec dW;
+    ColVec db;
+    struct grads grads;
+
+    HostData(int num_batches, int minibatch_size, NeuralNetwork& nn, int N) {
+      X = arma::zeros<arma::Mat<real>>(nn.H[0], N);
+      y = arma::zeros<arma::Mat<real>>(nn.H[2], N);
+      // X = MatVec(num_batches, arma::zeros<arma::Mat<real>>(minibatch_size, nn.H[0]));
+      // y = MatVec(num_batches, arma::zeros<arma::Mat<real>>(minibatch_size, nn.H[2]));
+      initialize(dW, db, nn);
+      initialize(grads.dW, grads.db, nn);
+    }
+  private:
+    void initialize(MatVec& W, ColVec& b, NeuralNetwork& nn) {
+      W.resize((size_t) nn.num_layers);
+      b.resize((size_t) nn.num_layers);
+
+      for (int i = 0; i < nn.num_layers; ++i) {
+        W[i] = arma::zeros<arma::Mat<real>>(arma::size(nn.W[i]));
+        b[i] = arma::zeros<arma::Col<real>>(arma::size(nn.b[i]));
+      }
+    }
+};
+
+class MPIBatchInfo {
+  public:
+    int num_procs;
+    int batch_size;
+    int N;
+
+    // whole batch info
+    int total_batch_size;
+    int first_col;
+    int last_col;
+    int* minibatch_sizes;
+    int* minibatch_sizes_X;
+    int* displacements_X;
+    int* minibatch_sizes_y;
+    int* displacements_y;
+
+    MPIBatchInfo(int _num_procs, int _batch_size, int _N) : 
+            num_procs(_num_procs), batch_size(_batch_size), N(_N) {
+      minibatch_sizes = (int*) std::malloc(sizeof(int) * num_procs);
+      minibatch_sizes_X = (int*) std::malloc(sizeof(int) * num_procs);
+      displacements_X = (int*) std::malloc(sizeof(int) * num_procs);
+      minibatch_sizes_y = (int*) std::malloc(sizeof(int) * num_procs);
+      displacements_y = (int*) std::malloc(sizeof(int) * num_procs);
+    }
+
+    ~MPIBatchInfo() {
+      std::free(minibatch_sizes);
+      std::free(minibatch_sizes_X);
+      std::free(displacements_X);
+      std::free(minibatch_sizes_y);
+      std::free(displacements_y);
+    }
+
+    void batchScatterArgs(const int image_size, const int n_classes, const int total_batch_size) {
+      int minibatch_size = (total_batch_size + num_procs - 1) / num_procs;
+      int last_batch_size = (total_batch_size % minibatch_size)? 
+                            total_batch_size % minibatch_size : minibatch_size;
+      assert(total_batch_size == minibatch_size * (num_procs - 1) + last_batch_size);
+
+      for (int i = 0; i < num_procs; ++i) {
+        displacements_X[i] = i * minibatch_size * image_size;
+        displacements_y[i] = i * minibatch_size * n_classes;
+
+        minibatch_sizes[i] = (i < num_procs - 1) ? minibatch_size : last_batch_size;
+        minibatch_sizes_X[i] = minibatch_sizes[i] * image_size;
+        minibatch_sizes_y[i] = minibatch_sizes[i] * n_classes;
+      }
+    }
+};
+
+
 real norms(NeuralNetwork& nn) {
   real norm_sum = 0;
 
@@ -30,17 +117,6 @@ real norms(NeuralNetwork& nn) {
   }
 
   return norm_sum;
-}
-
-void initialize(std::vector<arma::Mat<real>>& W, 
-                      std::vector<arma::Col<real>>& b, NeuralNetwork& nn) {
-  W.resize((size_t) nn.num_layers);
-  b.resize((size_t) nn.num_layers);
-
-  for (int i = 0; i < nn.num_layers; ++i) {
-    W[i] = arma::zeros<arma::Mat<real>>(arma::size(nn.W[i]));
-    b[i] = arma::zeros<arma::Mat<real>>(arma::size(nn.b[i]));
-  }
 }
 
 void write_cpudata_tofile(NeuralNetwork& nn, int iter) {
@@ -149,23 +225,6 @@ void feedforward(NeuralNetwork& nn, const arma::Mat<real>& X,
   cache.a[1] = cache.yc = a2;
 }
 
-void parallel_feedforward(DeviceNeuralNetwork& nn, real* X,
-                          DeviceCache& cache) {
-  int N = cache.N;
-  cache.LoadBias(nn.b);
-
-  myGEMM(nn.W[0], X, cache.z[0], 1., 1., nn.H[1], N, nn.H[0], true);
-
-  deviceSigmoid(cache.z[0], nn.H[1], N);
-  cache.recordAFromZ();
-
-  myGEMM(nn.W[1], cache.z[0], cache.z[1], 1., 1., nn.H[2], N, nn.H[1], true);
-
-  deviceSoftmax(cache.z[1], nn.H[2], N);
-
-  cache.yc = cache.z[1];
-}
-
 /*
  * Computes the gradients of the cost w.r.t each param.
  * MUST be called after feedforward since it uses the bpcache.
@@ -188,41 +247,6 @@ void backprop(NeuralNetwork& nn, const arma::Mat<real>& y, real reg,
 
   bpgrads.dW[0] = dz1 * bpcache.X.t() + reg * nn.W[0];
   bpgrads.db[0] = arma::sum(dz1, 1);
-}
-
-void parallel_backprop(DeviceNeuralNetwork& nn, real* y, real reg,
-              DeviceCache& bpcache, DeviceGrads& bpgrads, real contrib, 
-              real lr) {
-
-  int N = bpcache.N;
-  bpgrads.LoadWeightMatrices(nn.W);
-
-  real* diff = deviceToDeviceCopy(y, nn.H[2]* N);   // reuse
-  deviceSubtract(bpcache.yc, diff, 1.0/N, nn.H[2], N);
-
-  myGEMM(diff, bpcache.a[0], bpgrads.dW[1], 
-          1., reg, nn.H[2], nn.H[1], N, 
-          false, false, true);
-
-  deviceSum(diff, bpgrads.db[1], 1., nn.H[2], N);
-
-  setToZero(bpgrads.dz, nn.H[1]*N);
-  myGEMM(nn.W[1], diff, bpgrads.dz, 1., 0., nn.H[1], N, nn.H[2], 
-          false, true, false);
-
-  deviceSigmoidBackward(bpcache.a[0], bpgrads.dz, nn.H[1], N);
-
-  myGEMM(bpgrads.dz, bpcache.X, bpgrads.dW[0], 
-          1., reg, nn.H[1], nn.H[0], N, 
-          false, false, true);
-
-  deviceSum(bpgrads.dz, bpgrads.db[0], 1., nn.H[1], N);
-
-  # pragma unroll
-  for (int i=0; i < nn.num_layers; i++) {
-    deviceUpdateParam(bpgrads.dW[i], nn.W[i], lr, contrib, nn.H[i+1], nn.H[i]);
-    deviceUpdateParam(bpgrads.db[i], nn.b[i], lr, contrib, nn.H[i+1], 1);
-  }
 }
 
 /*
@@ -369,15 +393,65 @@ void train(NeuralNetwork& nn, const arma::Mat<real>& X,
   std::cout << "Exited train" << std::endl;
 }
 
+int get_minibatch_size(const int batch, const int batch_size, const int N, 
+                      const int rank, const int num_procs) {
+    int first_col = batch_size * batch;
+    int last_col = std::min((batch + 1) * batch_size - 1, N - 1);
+    int total_batch_size = last_col - first_col + 1;
+    int minibatch_size = (total_batch_size + num_procs - 1) / num_procs;
+    int last_batch_size = (total_batch_size % minibatch_size)? 
+                          total_batch_size % minibatch_size : minibatch_size;
+    return (rank < num_procs - 1)? minibatch_size : last_batch_size;
+}
+
 /*********************************************************************************
  *                          PARALLEL IMPLEMENTATION
  *********************************************************************************/
+void parallel_feedforward(DeviceNeuralNetwork& nn, real* X,
+                          DeviceCache& cache) {
+  int N = cache.N;
+  cache.LoadBias(nn.b);
 
-/*
- * TODO
- * Train the neural network nn of rank 0 in parallel. Your MPI implementation
- * should mainly be in this function.
- */
+  myGEMM(nn.W[0], X, cache.z[0], 1., 1., nn.H[1], N, nn.H[0], true);
+
+  deviceSigmoid(cache.z[0], nn.H[1], N);
+  cache.recordAFromZ();
+
+  myGEMM(nn.W[1], cache.z[0], cache.z[1], 1., 1., nn.H[2], N, nn.H[1], true);
+
+  deviceSoftmax(cache.z[1], nn.H[2], N);
+
+  cache.yc = cache.z[1];
+}
+
+void parallel_backprop(DeviceNeuralNetwork& nn, real* y, real reg,
+              DeviceCache& bpcache, DeviceGrads& bpgrads, real contrib) {
+
+  int N = bpcache.N;
+  bpgrads.LoadWeightMatrices(nn.W);
+
+  real* diff = deviceToDeviceCopy(y, nn.H[2]* N);   // reuse
+  deviceSubtract(bpcache.yc, diff, 1.0/N, nn.H[2], N);
+
+  myGEMM(diff, bpcache.a[0], bpgrads.dW[1], 
+          contrib, contrib * reg, nn.H[2], nn.H[1], N, 
+          false, false, true);
+
+  deviceSum(diff, bpgrads.db[1], contrib, nn.H[2], N);
+
+  setToZero(bpgrads.dz, nn.H[1]*N);
+  myGEMM(nn.W[1], diff, bpgrads.dz, 1., 0., nn.H[1], N, nn.H[2], 
+          false, true, false);
+
+  deviceSigmoidBackward(bpcache.a[0], bpgrads.dz, nn.H[1], N);
+
+  myGEMM(bpgrads.dz, bpcache.X, bpgrads.dW[0], 
+          contrib, contrib * reg, nn.H[1], nn.H[0], N, 
+          false, false, true);
+
+  deviceSum(bpgrads.dz, bpgrads.db[0], contrib, nn.H[1], N);
+}
+
 void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
                     const arma::Mat<real>& y, real learning_rate, real reg,
                     const int epochs, const int batch_size, bool grad_check,
@@ -392,96 +466,103 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
   int img_size = nn.H[0];
   int n_classes = nn.H[2];
 
-  MPIBatchInfo bi(num_procs, batch_size, N);
-  DeviceNeuralNetwork dnn(nn.H);
-  DeviceGrads grads(nn.H, N);
-
-  int total_batch_size = std::min(batch_size - 1, N - 1) + 1;
+  int total_batch_size = std::min(batch_size, N);
   int ceil_minibatch_size = (total_batch_size + num_procs - 1) / num_procs;
-  ceil_minibatch_size = (total_batch_size % ceil_minibatch_size)? total_batch_size % ceil_minibatch_size : ceil_minibatch_size;
+  const int num_batches = (N + batch_size - 1) / batch_size;
+
+  // Host data 
+  HostData host(num_batches, ceil_minibatch_size, nn, N);
+  if (rank == 0) {
+    host.X = arma::Mat<real>(X.memptr(), img_size, N);
+    host.y = arma::Mat<real>(y.memptr(), n_classes, N);
+  }
+
+  MPI_Request xy_reqs[2];
+  MPI_SAFE_CALL(MPI_Ibcast(host.X.memptr(), img_size * N, MPI_FP, 0, 
+                          MPI_COMM_WORLD, &xy_reqs[0]));
+  MPI_SAFE_CALL(MPI_Ibcast(host.y.memptr(), n_classes * N, MPI_FP, 0, 
+                          MPI_COMM_WORLD, &xy_reqs[1]));
+
+  // Device Data
+  DeviceNeuralNetwork dnn(nn.H);
+  dnn.CopyToDevice(nn.W, nn.b);
+  DeviceGrads grads(nn.H, N);
   DeviceCache cache(nn.H, ceil_minibatch_size);
 
-  // std::ofstream error_file;
-  // error_file.open("Outputs/CpuGpuDiff.txt");
+  std::ofstream error_file;
+  error_file.open("Outputs/CpuGpuDiff.txt");
   int print_flag = 0;
   int iter = 0;
 
-  for (int epoch = 0; epoch < epochs; ++epoch) {
-    int num_batches = (N + batch_size - 1) / batch_size;
+  MPI_SAFE_CALL(MPI_Waitall(2, xy_reqs, MPI_STATUS_IGNORE));
+  DeviceData data(host.X.memptr(), host.y.memptr(), N, img_size, n_classes);
 
+  for (int epoch = 0; epoch < epochs; ++epoch) {
     for (int batch = 0; batch < num_batches; ++batch) {
       int first_col = batch_size * batch;
-      int last_col = std::min((batch + 1) * batch_size - 1, N - 1);
-      total_batch_size = last_col - first_col + 1;
-
-      if (rank == 0) {
-        bi.batchUpdate(X, y, total_batch_size);
-      }
-
+      int last_col = std::min((batch + 1) * batch_size, N);
+      total_batch_size = last_col - first_col;
       int minibatch_size = (total_batch_size + num_procs - 1) / num_procs;
-      if (rank == num_procs - 1) {
-        minibatch_size = (total_batch_size % minibatch_size)? 
-                                    total_batch_size % minibatch_size : minibatch_size;
-      }
-
-      const real* batch_X = (rank == 0) ? X.colptr(first_col) : nullptr;
-      const real* batch_y = (rank == 0) ? y.colptr(first_col) : nullptr;
-
-      arma::Mat<real> minibatch_X(minibatch_size, img_size);
-      arma::Mat<real> minibatch_y(minibatch_size, n_classes);
-      MPI_SAFE_CALL(MPI_Scatterv(batch_X, bi.minibatch_sizes_X, bi.displacements_X, 
-                    MPI_FP, minibatch_X.memptr(), minibatch_size * img_size, MPI_FP, 0, MPI_COMM_WORLD));
-
-      MPI_SAFE_CALL(MPI_Scatterv(batch_y, bi.minibatch_sizes_y, bi.displacements_y, 
-                    MPI_FP, minibatch_y.memptr(), minibatch_size * n_classes, MPI_FP, 0, MPI_COMM_WORLD));
+      int last_batch_size = (total_batch_size % minibatch_size)? 
+                            total_batch_size % minibatch_size : minibatch_size;
+      int curr_minibatch_size = (rank < num_procs - 1)? 
+                                              minibatch_size : last_batch_size;
 
       // Device variables 
-      dnn.CopyToDevice(nn.W, nn.b);
-      DeviceData data(minibatch_X.memptr(), minibatch_y.memptr(), minibatch_size, 
-                      img_size, n_classes);
       real contrib = ((real) minibatch_size) / ((real) total_batch_size);
-      cache.X = data.X;
-      cache.N = minibatch_size;
+      int col = first_col + (minibatch_size * rank);
+      cache.N = curr_minibatch_size;
+      cache.X = data.X + col*img_size;
 
       // 2. compute each sub-batch of images' contribution to network coefficient updates
-      parallel_feedforward(dnn, data.X, cache);
-      parallel_backprop(dnn, data.y, reg, cache, grads, contrib, learning_rate);
-
-      // Copy gradients from device to host 
-      // just using the bpgrads struct to save nn W videos
-      std::vector<arma::Mat<real>> sendW;
-      std::vector<arma::Col<real>> sendb;
-      initialize(sendW, sendb, nn);
-      dnn.CopyToHost(sendW, sendb);
+      parallel_feedforward(dnn, data.X + col * img_size, cache);
+      parallel_backprop(dnn, data.y + col * n_classes, reg, cache, grads, contrib);
 
       // 3. reduce the coefficient updates and broadcast to all nodes with`MPI_Allreduce()
-
+      // Copy gradients from device to host 
+      grads.CopyToHost(host.grads.dW, host.grads.db);
       MPI_Request reqs[nn.num_layers * 2];
-      # pragma unroll
-      for (int i = 0; i < nn.num_layers; ++i) {
-        MPI_SAFE_CALL(MPI_Iallreduce(sendW[i].memptr(), nn.W[i].memptr(), 
-                      sendW[i].n_elem, MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[i]));
-        MPI_SAFE_CALL(MPI_Iallreduce(sendb[i].memptr(), nn.b[i].memptr(), 
-                      sendb[i].n_elem, MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[i + nn.num_layers])); 
-      }
-      MPI_Waitall(num_procs, reqs, MPI_STATUSES_IGNORE);
+      MPI_SAFE_CALL(MPI_Iallreduce(host.grads.dW[0].memptr(), host.dW[0].memptr(), 
+                    nn.H[0] * nn.H[1], MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[0]));
+
+      MPI_SAFE_CALL(MPI_Iallreduce(host.grads.db[0].memptr(), host.db[0].memptr(), 
+                    nn.H[1], MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[2]));
+
+      MPI_SAFE_CALL(MPI_Iallreduce(host.grads.dW[1].memptr(), host.dW[1].memptr(), 
+                    nn.H[1] * nn.H[2], MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[1]));
+
+      MPI_SAFE_CALL(MPI_Iallreduce(host.grads.db[1].memptr(), host.db[1].memptr(), 
+                    nn.H[2], MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[3])); 
+
+      MPI_SAFE_CALL(MPI_Waitall(nn.num_layers * 2, reqs, MPI_STATUS_IGNORE));
+      grads.CopyToDevice(host.dW, host.db);
+
+      // 4. update local network coefficient at each node
+      deviceUpdateParam(grads.dW[0], dnn.W[0], learning_rate, nn.H[1], nn.H[0]);
+      deviceUpdateParam(grads.db[0], dnn.b[0], learning_rate, nn.H[1], 1); 
+      deviceUpdateParam(grads.dW[1], dnn.W[1], learning_rate, nn.H[2], nn.H[1]);
+      deviceUpdateParam(grads.db[1], dnn.b[1], learning_rate, nn.H[2], 1);    
 
       // +-*=+-*=+-*=+-*=+-*=+-*=+-*=+-*=+*-=+-*=+*-=+-*=+-*=+-*=+-*=+-*= //
       //                    POST-PROCESS OPTIONS                          //
       // +-*=+-*=+-*=+-*=+-*=+-*=+-*=+-*=+*-=+-*=+*-=+-*=+-*=+-*=+-*=+-*= //
-      // if (print_every <= 0) {
-      //   print_flag = batch == 0;
-      // } else {
-      //   print_flag = iter % print_every == 0;
-      // }
+      if (print_every <= 0) {
+        print_flag = batch == 0;
+      } else {
+        print_flag = iter % print_every == 0;
+      }
 
-      // if (debug && rank == 0 && print_flag) {
-      //   write_diff_gpu_cpu(nn, iter, error_file);
-      //   write_gpudata_tofile(nn, iter);
-      // }
+      if (debug && rank == 0 && print_flag) {
+        dnn.CopyToHost(nn.W, nn.b);
+        write_diff_gpu_cpu(nn, iter, error_file);
+        write_gpudata_tofile(nn, iter);
+      }
 
       iter++;
     }
   }
-  // error_file.close();
+  dnn.CopyToHost(nn.W, nn.b);
+  error_file.close();
 }
+
+

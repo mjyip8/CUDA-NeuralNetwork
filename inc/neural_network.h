@@ -2,7 +2,6 @@
 #define UTILS_TWO_LAYER_NET_H_
 
 #include <armadillo>
-#include <cassert>
 #include <cmath>
 #include <iostream>
 
@@ -33,56 +32,6 @@ class NeuralNetwork {
   }
 };
 
-class MPIBatchInfo {
-  public:
-    int num_procs;
-    int batch_size;
-    int N;
-
-    // whole batch info
-    int total_batch_size;
-    int first_col;
-    int last_col;
-    int* minibatch_sizes;
-    int* minibatch_sizes_X;
-    int* displacements_X;
-    int* minibatch_sizes_y;
-    int* displacements_y;
-
-    MPIBatchInfo(int _num_procs, int _batch_size, int _N) : 
-            num_procs(_num_procs), batch_size(_batch_size), N(_N) {
-      minibatch_sizes = (int*) std::malloc(sizeof(int) * num_procs);
-      minibatch_sizes_X = (int*) std::malloc(sizeof(int) * num_procs);
-      displacements_X = (int*) std::malloc(sizeof(int) * num_procs);
-      minibatch_sizes_y = (int*) std::malloc(sizeof(int) * num_procs);
-      displacements_y = (int*) std::malloc(sizeof(int) * num_procs);
-    }
-
-    ~MPIBatchInfo() {
-      std::free(minibatch_sizes);
-      std::free(minibatch_sizes_X);
-      std::free(displacements_X);
-      std::free(minibatch_sizes_y);
-      std::free(displacements_y);
-    }
-
-    void batchUpdate(const arma::Mat<real>& X, const arma::Mat<real>& y, const int total_batch_size) {
-      int minibatch_size = (total_batch_size + num_procs - 1) / num_procs;
-      int last_batch_size = (total_batch_size % minibatch_size)? 
-                            total_batch_size % minibatch_size : minibatch_size;
-      assert(total_batch_size == minibatch_size * (num_procs - 1) + last_batch_size);
-
-      # pragma unroll
-      for (int i = 0; i < num_procs; ++i) {
-        minibatch_sizes[i] = (i < num_procs - 1) ? minibatch_size : last_batch_size;
-        displacements_X[i] = i * minibatch_sizes[i] * X.n_rows;
-        displacements_y[i] = i * minibatch_sizes[i] * y.n_rows;
-        minibatch_sizes_X[i] = minibatch_sizes[i] * X.n_rows;
-        minibatch_sizes_y[i] = minibatch_sizes[i] * y.n_rows;
-      }
-    }
-};
-
 void feedforward(NeuralNetwork& nn, const arma::Mat<real>& X,
                  struct cache& bpcache);
 real loss(NeuralNetwork& nn, const arma::Mat<real>& yc,
@@ -103,8 +52,5 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
                     real reg = 0.0, const int epochs = 15,
                     const int batch_size = 800, bool grad_check = false,
                     int print_every = -1, int debug = 0);
-
-void initialize(std::vector<arma::Mat<real>>& W, 
-                      std::vector<arma::Col<real>>& b, NeuralNetwork& nn);
 
 #endif

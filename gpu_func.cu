@@ -8,6 +8,7 @@
 
 #define GLOBAL 1
 #define SMEM 2
+#define STRIDED_SMEM 3
 #define BLOCK_SIZE 32
 
 #define SMAX_STRIDE 16
@@ -101,6 +102,64 @@ void smeMM(real* __restrict__ A, real* __restrict__ B,
             add_term = beta * C_term;
         }
         C[gRow + gCol * M] = alpha * accumulator + add_term;
+    }
+}
+
+// TODO: do transposeA and transposeB tests later
+__global__
+void stridedSMEMM(real* __restrict__ A, real* __restrict__ B,
+           real* __restrict__ C, real alpha, real beta,
+           int M, int N, int K, 
+           bool isVec, bool transposeA, bool transposeB) {
+    int blockRow = blockIdx.y * 64;
+    int blockCol = blockIdx.x * 16;
+    int row = threadIdx.y;
+    int col = threadIdx.x;
+    int tr = threadIdx.y + blockDim.y * threadIdx.x;
+    int gRow = blockRow + tr;
+
+    if (blockRow >= M || blockCol >= N) return;
+
+    real accumulator[16];
+    memset(&accumulator[0], 0, sizeof(real) * 16);               
+    real A_miniblock[4];
+
+    __shared__ real B_block[16][4];
+
+    for (int ptr = 0; ptr < K; ptr += 4) {
+        int br = ptr + col;
+        int bc = blockCol + row;
+        if (br < K && bc < N)
+            B_block[row][col] = B[br + bc * K];
+
+        __syncthreads();
+
+        memset(&A_miniblock[0], 0, sizeof(real) * 4);
+
+        # pragma unroll 
+        for (int i = 0; i < 4 && ptr + i < K; ++i) {
+            A_miniblock[i] = A[gRow + (ptr + i) * M];
+        }
+
+        # pragma unroll 
+        for (int c = 0; c < 16; ++c) {
+            for (int r = 0; r < 4; ++r) {
+                accumulator[c] += A_miniblock[r] * B_block[c][r];
+            }
+        }
+
+        __syncthreads();
+
+    }
+
+    if (gRow >= M) return;
+
+    # pragma unroll
+    for (int c = 0; c < 16; ++c) {
+        int idx = gRow + (blockCol + c) * M;
+        int add_idx = idx;
+        if (blockCol + c >= N) break;
+        C[idx] = accumulator[c] * alpha + C[add_idx] * beta;
     }
 }
 
@@ -232,13 +291,18 @@ int myGEMM(real* __restrict__ A, real* __restrict__ B,
            bool isVec, bool transposeA, bool transposeB) {
     dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
     dim3 blocks((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
-    int algorithm = GLOBAL;
+    int algorithm = STRIDED_SMEM;
     switch (algorithm) {
         case GLOBAL:
             globalMM<<<blocks, threads>>>(A, B, C, *alpha, *beta, M, N, K, isVec, transposeA, transposeB);
             break;
         case SMEM:
             smeMM<<<blocks, threads>>>(A, B, C, *alpha, *beta, M, N, K, isVec, transposeA, transposeB);
+            break;
+        case STRIDED_SMEM:
+            dim3 stridedThreads(4, 16);
+            dim3 stridedBlocks((N + 15) / 16, (M + 63) / 64);
+            stridedSMEMM<<<stridedBlocks, stridedThreads>>>(A, B, C, *alpha, *beta, M, N, K, isVec, transposeA, transposeB);
             break;
       }
   return 0;

@@ -21,6 +21,35 @@ void deviceMalloc(real*& ptr, int size);
 /***************************************************************
  *                     DEVICE CLASSES
  ***************************************************************/
+
+class CudaStreams {
+  public:
+    const int n_streams = 4;
+    std::vector<cudaStream_t> stream;
+    // Create Streams
+
+    CudaStreams() {
+      stream.resize(n_streams);
+      for (auto i = 0; i < n_streams; ++i) 
+        checkCudaErrors( cudaStreamCreate(&stream[i]) );
+    }
+
+    ~CudaStreams() {
+      for (int i = 0; i < n_streams; ++i) 
+          checkCudaErrors( cudaStreamDestroy(stream[i]) );
+    }
+
+    void synchronize(int i) {
+      cudaStreamSynchronize(stream[i]);
+    }
+
+    void synchronizeAll() {
+      for (int i = 0; i < n_streams; ++i)
+        cudaStreamSynchronize(stream[i]);
+    }
+
+};
+
 class DeviceNeuralNetwork {
  public:
   const int num_layers = 2;
@@ -86,10 +115,7 @@ class DeviceGrads {
     real* dz;
     int N;
 
-    DeviceGrads(std::vector<int> _H, const int _N) {
-      H = _H;
-      N = _N;
-
+    DeviceGrads(std::vector<int> _H, const int _N) : H(_H), N(_N) {
       dW.resize((size_t) NUM_LAYERS);
       db.resize((size_t) NUM_LAYERS);
 
@@ -108,35 +134,82 @@ class DeviceGrads {
       checkCudaErrors(cudaFree(dz));
     }
 
-    void LoadWeightMatrices(std::vector<real *> W) {
-      checkCudaErrors(cudaMemcpy(dW[0], W[0], sizeof(real) * H[1] * H[0], 
-                      cudaMemcpyDeviceToDevice));
-      checkCudaErrors(cudaMemcpy(dW[1], W[1], sizeof(real) * H[2] * H[1], 
-                      cudaMemcpyDeviceToDevice));
+    void LoadWeightMatrices(std::vector<real *> W, CudaStreams& streams) {
+      checkCudaErrors(cudaMemcpyAsync(dW[0], W[0], sizeof(real) * H[1] * H[0], 
+                      cudaMemcpyDeviceToDevice, streams.stream[0]));
+      checkCudaErrors(cudaMemcpyAsync(dW[1], W[1], sizeof(real) * H[2] * H[1], 
+                      cudaMemcpyDeviceToDevice, streams.stream[1]));
     }
 
-    void CopyToHost(std::vector<arma::Mat<real>>& hdW, 
-                    std::vector<arma::Col<real>>& hdb) {
-      checkCudaErrors(cudaMemcpy(hdW[0].memptr(), dW[0], sizeof(real) * H[1] * H[0], 
+    void CopyToHost(std::vector<real*>& hdW, 
+                    std::vector<real*>& hdb) {
+      checkCudaErrors(cudaMemcpy(hdW[0], dW[0], sizeof(real) * H[1] * H[0], 
                       cudaMemcpyDeviceToHost));
-      checkCudaErrors(cudaMemcpy(hdb[0].memptr(), db[0], sizeof(real) * H[1], 
+      checkCudaErrors(cudaMemcpy(hdb[0], db[0], sizeof(real) * H[1], 
                       cudaMemcpyDeviceToHost));
-      checkCudaErrors(cudaMemcpy(hdW[1].memptr(), dW[1], sizeof(real) * H[2] * H[1], 
+      checkCudaErrors(cudaMemcpy(hdW[1], dW[1], sizeof(real) * H[2] * H[1], 
                       cudaMemcpyDeviceToHost));
-      checkCudaErrors(cudaMemcpy(hdb[1].memptr(), db[1], sizeof(real) * H[2], 
+      checkCudaErrors(cudaMemcpy(hdb[1], db[1], sizeof(real) * H[2], 
                       cudaMemcpyDeviceToHost));
     }
 
-    void CopyToDevice(std::vector<arma::Mat<real>>& hdW, 
-                    std::vector<arma::Col<real>>& hdb) {
-      checkCudaErrors(cudaMemcpy(dW[0], hdW[0].memptr(), sizeof(real) * H[1] * H[0], 
+    void CopyToDevice(std::vector<real*>& hdW, 
+                    std::vector<real*>& hdb) {
+      checkCudaErrors(cudaMemcpy(dW[0], hdW[0], sizeof(real) * H[1] * H[0], 
                       cudaMemcpyHostToDevice));
-      checkCudaErrors(cudaMemcpy(db[0], hdb[0].memptr(), sizeof(real) * H[1], 
+      checkCudaErrors(cudaMemcpy(db[0], hdb[0], sizeof(real) * H[1], 
                       cudaMemcpyHostToDevice));
-      checkCudaErrors(cudaMemcpy(dW[1], hdW[1].memptr(), sizeof(real) * H[2] * H[1], 
+      checkCudaErrors(cudaMemcpy(dW[1], hdW[1], sizeof(real) * H[2] * H[1], 
                       cudaMemcpyHostToDevice));
-      checkCudaErrors(cudaMemcpy(db[1], hdb[1].memptr(), sizeof(real) * H[2], 
+      checkCudaErrors(cudaMemcpy(db[1], hdb[1], sizeof(real) * H[2], 
                       cudaMemcpyHostToDevice));
+    }
+};
+
+class HostData {
+  public:
+    real* X;
+    real* y;
+
+    std::vector<real*> local_dW;
+    std::vector<real*> local_db;
+    std::vector<real*> sum_dW;
+    std::vector<real*> sum_db;
+    int N;
+    std::vector<int> H;
+    const int num_layers = 2;
+
+    HostData(std::vector<int> _H, int _N) : H(_H), N(_N) {
+      checkCudaErrors( cudaMallocHost(&X, sizeof(real) * N * H[0]) );
+      checkCudaErrors( cudaMallocHost(&y, sizeof(real) * N * H[2]) );
+      initialize(local_dW, local_db);
+      initialize(sum_dW, sum_db);
+    }
+
+    ~HostData() {
+      for (size_t i = 0; i < local_dW.size(); ++i) {
+        cudaFreeHost(local_dW[i]);
+        cudaFreeHost(sum_dW[i]);
+        cudaFreeHost(local_db[i]);
+        cudaFreeHost(sum_db[i]);
+      }
+      cudaFreeHost(X);
+      cudaFreeHost(y);
+    }
+
+    void copyDataToHost(const real* hX, const real* hy) {
+      checkCudaErrors( cudaMemcpy(X, hX, sizeof(real) * N * H[0], cudaMemcpyHostToHost) );
+      checkCudaErrors( cudaMemcpy(y, hy, sizeof(real) * N * H[2], cudaMemcpyHostToHost) );
+    }
+
+  private:
+    void initialize(std::vector<real*>& W, std::vector<real*>& b) {
+      W.resize((size_t) num_layers);
+      b.resize((size_t) num_layers);
+      checkCudaErrors( cudaMallocHost(&W[0], sizeof(real) * H[0] * H[1]) );
+      checkCudaErrors( cudaMallocHost(&b[0], sizeof(real) * H[1] ) );
+      checkCudaErrors( cudaMallocHost(&W[1], sizeof(real) * H[1] * H[2]) );
+      checkCudaErrors( cudaMallocHost(&b[1], sizeof(real) * H[2] ) );
     }
 };
 
@@ -171,11 +244,11 @@ class DeviceCache {
       checkCudaErrors(cudaMemcpy(a[0], z[0], sizeof(real) * H[1] * N, cudaMemcpyDeviceToDevice));
     }
 
-    void LoadBias(std::vector<real *>& b) {
-      for (int i = 0; i < (int) z.size(); ++i) {
-        checkCudaErrors(cudaMemcpy(z[i] + (N * H[i+1]), b[i], sizeof(real) * H[i + 1], 
-                        cudaMemcpyDeviceToDevice));
-      }
+    void LoadBias(std::vector<real *>& b, CudaStreams& streams) {
+      checkCudaErrors(cudaMemcpyAsync(z[0] + (N * H[1]), b[0], sizeof(real) * H[1], 
+                      cudaMemcpyDeviceToDevice, streams.stream[2]));
+      checkCudaErrors(cudaMemcpyAsync(z[1] + (N * H[2]), b[1], sizeof(real) * H[2], 
+                      cudaMemcpyDeviceToDevice, streams.stream[3]));
     }
 };
 
@@ -278,6 +351,9 @@ int myGEMM(real* A, real* B, real* C, real* alpha, real* beta, int M, int N,
            int K, bool isVec=false, bool transposeA=false, bool transposeB=false);
 int myGEMM(real* A, real* B, real* C, real alpha, real beta, int M, int N,
            int K, bool isVec=false, bool transposeA=false, bool transposeB=false);
+int myGEMMAsync(real* A, real* B, real* C, real alpha, real beta, int M, int N,
+           int K, CudaStreams& streams, int i, 
+           bool isVec=false, bool transposeA=false, bool transposeB=false);
 void transpose(real* A, real*& AT, int M, int N);
 
 /*------------------ FORWARD PASS WRAPPERS ---------------------*/
@@ -293,10 +369,13 @@ void deviceSoftmax(real* Z, int M, int N);
 
 void deviceSubtract(real* A, real*B, real k, int M, int N);
 
-void deviceSum(real* A, real* result, real k, int K, int N);
+void deviceSum(real* A, real* result, real k, int K, int N, CudaStreams& streams, int i);
 
 void deviceSigmoidBackward(real* S, real* A, int M, int N);
 
-void deviceUpdateParam(real* A, real*B, real lr, int M, int N);
+void deviceUpdateParam(real* A, real*B, real lr, int M, int N, cudaStream_t& s);
+
+void deviceUpdateStep(HostData& host, DeviceGrads& grads, DeviceNeuralNetwork& dnn, 
+                      real learning_rate, CudaStreams& streams);
 
 #endif

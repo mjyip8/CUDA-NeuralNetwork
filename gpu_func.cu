@@ -4,6 +4,7 @@
 #include <helper_functions.h>
 #include <iostream>
 #include "cublas_v2.h"
+#include "mpi.h"
 
 #define GLOBAL 1
 #define SMEM 2
@@ -12,6 +13,16 @@
 #define SMAX_STRIDE 16
 #define N_CLASSES 10
 #define SUM_STRIDE 32
+
+#define MPI_SAFE_CALL(call)                                                  \
+  do {                                                                       \
+    int err = call;                                                          \
+    if (err != MPI_SUCCESS) {                                                \
+      fprintf(stderr, "MPI error %d in file '%s' at line %i", err, __FILE__, \
+              __LINE__);                                                     \
+      exit(1);                                                               \
+    }                                                                        \
+  } while (0)
 
 /***************************************************************
  *                           KERNELS
@@ -252,6 +263,24 @@ int myGEMM(real* __restrict__ A, real* __restrict__ B,
   return 0;
 }
 
+int myGEMMAsync(real* __restrict__ A, real* __restrict__ B,
+           real* __restrict__ C, real alpha, real beta,
+           int M, int N, int K, CudaStreams& streams, int i,
+           bool isVec, bool transposeA, bool transposeB) {
+    dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 blocks((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    int algorithm = GLOBAL;
+    switch (algorithm) {
+        case GLOBAL:
+            globalMM<<<blocks, threads, 0, streams.stream[i]>>>(A, B, C, alpha, beta, M, N, K, isVec, transposeA, transposeB);
+            break;
+        case SMEM:
+            smeMM<<<blocks, threads, 0, streams.stream[i]>>>(A, B, C, alpha, beta, M, N, K, isVec, transposeA, transposeB);
+            break;
+      }
+  return 0;
+}
+
 /*------------------ FORWARD PASS WRAPPERS ---------------------*/
 
 void deviceSigmoid(real* Z, int M, int N) {
@@ -277,7 +306,7 @@ void deviceSubtract(real* A, real*B, real k, int M, int N) {
     subtract<<<blockDims, threadDims>>>(A, B, k, M, N);
 }
 
-void deviceSum(real* A, real* result, real k, int K, int N) {
+void deviceSum(real* A, real* result, real k, int K, int N, CudaStreams& streams, int i) {
 
     // batch_size cases: 800, 400, 267, 266, 200, 100
     dim3 gridDim(K);
@@ -290,27 +319,27 @@ void deviceSum(real* A, real* result, real k, int K, int N) {
         threads = 512;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
-        sum<512><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
+        sum<512><<<gridDim, blockDim, sharedMemSize, streams.stream[i]>>>(A, result, k, K, N);
     } else if (floor_N <= 512 && floor_N > 256) { 
         threads = 256;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
-        sum<256><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
+        sum<256><<<gridDim, blockDim, sharedMemSize, streams.stream[i]>>>(A, result, k, K, N);
     } else if (floor_N <= 256 && floor_N > 128) {
         threads = 128;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
-        sum<128><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
+        sum<128><<<gridDim, blockDim, sharedMemSize, streams.stream[i]>>>(A, result, k, K, N);
     } else if (floor_N <= 128 && floor_N > 64) {
         threads = 64;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
-        sum<64><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
+        sum<64><<<gridDim, blockDim, sharedMemSize, streams.stream[i]>>>(A, result, k, K, N);
     } else {
         threads = 32;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
-        sum<32><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
+        sum<32><<<gridDim, blockDim, sharedMemSize, streams.stream[i]>>>(A, result, k, K, N);
     }
 }
 
@@ -320,10 +349,64 @@ void deviceSigmoidBackward(real* S, real* A, int M, int N) {
     sigmoidBackward<<<blockDims, threadDims>>>(S, A, M, N);
 }
 
-void deviceUpdateParam(real* A, real*B, real lr, int M, int N) {
-    dim3 threadDims(32, 32);
-    dim3 blockDims((M + threadDims.x - 1) / threadDims.x, (N + threadDims.y) / threadDims.y);
-    updateParam<<<blockDims, threadDims>>>(A, B, lr, M, N);
+void deviceUpdateParam(real* A, real*B, real lr, int M, int N, cudaStream_t& s) {
+    dim3 threadDims(32, (N > 1)? 32 : 1);
+    dim3 blockDims((M + threadDims.x - 1) / threadDims.x, 
+                    (N > 1)? ((N + threadDims.y) / threadDims.y) : 1);
+    updateParam<<<blockDims, threadDims, 0, s>>>(A, B, lr, M, N);
+}
+
+void deviceUpdateStep(HostData& host, DeviceGrads& grads, DeviceNeuralNetwork& dnn, 
+                        real learning_rate, CudaStreams& streams) {
+
+    streams.synchronizeAll();
+    // Copying from device to host
+    checkCudaErrors(cudaMemcpyAsync(host.local_dW[0], grads.dW[0], sizeof(real) * grads.H[1] * grads.H[0], 
+                  cudaMemcpyDeviceToHost, streams.stream[0]));
+    checkCudaErrors(cudaMemcpyAsync(host.local_db[0], grads.db[0], sizeof(real) * grads.H[1], 
+                  cudaMemcpyDeviceToHost, streams.stream[2]));
+    checkCudaErrors(cudaMemcpyAsync(host.local_dW[1], grads.dW[1], sizeof(real) * grads.H[2] * grads.H[1], 
+                  cudaMemcpyDeviceToHost, streams.stream[1]));
+    checkCudaErrors(cudaMemcpyAsync(host.local_db[1], grads.db[1], sizeof(real) * grads.H[2], 
+                  cudaMemcpyDeviceToHost, streams.stream[3]));
+
+    // Performing the MPI Call Here
+    MPI_Request reqs[grads.num_layers * 2];
+    cudaStreamSynchronize(streams.stream[0]);
+    MPI_SAFE_CALL(MPI_Iallreduce(host.local_dW[0], host.sum_dW[0], 
+                dnn.H[0] * dnn.H[1], MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[0]));
+
+    cudaStreamSynchronize(streams.stream[2]);
+    MPI_SAFE_CALL(MPI_Iallreduce(host.local_db[0], host.sum_db[0], 
+                dnn.H[1], MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[2]));
+
+    cudaStreamSynchronize(streams.stream[1]);
+    MPI_SAFE_CALL(MPI_Iallreduce(host.local_dW[1], host.sum_dW[1],  
+                dnn.H[1] * dnn.H[2], MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[1]));
+
+    cudaStreamSynchronize(streams.stream[3]);
+    MPI_SAFE_CALL(MPI_Iallreduce(host.local_db[1], host.sum_db[1],
+                dnn.H[2], MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[3])); 
+
+    // Coping back to device
+    MPI_Wait(&reqs[0], MPI_STATUS_IGNORE);
+    checkCudaErrors(cudaMemcpyAsync(grads.dW[0], host.sum_dW[0], sizeof(real) * dnn.H[1] * dnn.H[0], 
+                      cudaMemcpyHostToDevice, streams.stream[0]));
+    MPI_Wait(&reqs[2], MPI_STATUS_IGNORE);
+    checkCudaErrors(cudaMemcpyAsync(grads.db[0], host.sum_db[0], sizeof(real) * dnn.H[1], 
+                      cudaMemcpyHostToDevice, streams.stream[2]));
+    MPI_Wait(&reqs[1], MPI_STATUS_IGNORE);
+    checkCudaErrors(cudaMemcpyAsync(grads.dW[1], host.sum_dW[1], sizeof(real) * dnn.H[2] * dnn.H[1], 
+                      cudaMemcpyHostToDevice, streams.stream[1]));
+    MPI_Wait(&reqs[3], MPI_STATUS_IGNORE);
+    checkCudaErrors(cudaMemcpyAsync(grads.db[1], host.sum_db[1], sizeof(real) * dnn.H[2], 
+                      cudaMemcpyHostToDevice, streams.stream[3]));
+
+    // Performing the actual update
+    deviceUpdateParam(grads.dW[0], dnn.W[0], learning_rate, dnn.H[1], dnn.H[0], streams.stream[0]);
+    deviceUpdateParam(grads.db[0], dnn.b[0], learning_rate, dnn.H[1], 1, streams.stream[2]); 
+    deviceUpdateParam(grads.dW[1], dnn.W[1], learning_rate, dnn.H[2], dnn.H[1], streams.stream[1]);
+    deviceUpdateParam(grads.db[1], dnn.b[1], learning_rate, dnn.H[2], 1, streams.stream[3]); 
 }
 
 /*------------------ HELPER FUNCTIONS ---------------------*/

@@ -28,35 +28,6 @@ typedef std::vector<arma::Col<real>> ColVec;
 /***************************************************************
  *                     HOST CLASSES
  ***************************************************************/
-class HostData {
-  public:
-    // MatVec X;
-    // MatVec y;
-    arma::Mat<real> X;
-    arma::Mat<real> y;
-    MatVec dW;
-    ColVec db;
-    struct grads grads;
-
-    HostData(int num_batches, int minibatch_size, NeuralNetwork& nn, int N) {
-      X = arma::zeros<arma::Mat<real>>(nn.H[0], N);
-      y = arma::zeros<arma::Mat<real>>(nn.H[2], N);
-      // X = MatVec(num_batches, arma::zeros<arma::Mat<real>>(minibatch_size, nn.H[0]));
-      // y = MatVec(num_batches, arma::zeros<arma::Mat<real>>(minibatch_size, nn.H[2]));
-      initialize(dW, db, nn);
-      initialize(grads.dW, grads.db, nn);
-    }
-  private:
-    void initialize(MatVec& W, ColVec& b, NeuralNetwork& nn) {
-      W.resize((size_t) nn.num_layers);
-      b.resize((size_t) nn.num_layers);
-
-      for (int i = 0; i < nn.num_layers; ++i) {
-        W[i] = arma::zeros<arma::Mat<real>>(arma::size(nn.W[i]));
-        b[i] = arma::zeros<arma::Col<real>>(arma::size(nn.b[i]));
-      }
-    }
-};
 
 class MPIBatchInfo {
   public:
@@ -408,15 +379,18 @@ int get_minibatch_size(const int batch, const int batch_size, const int N,
  *                          PARALLEL IMPLEMENTATION
  *********************************************************************************/
 void parallel_feedforward(DeviceNeuralNetwork& nn, real* X,
-                          DeviceCache& cache) {
+                          DeviceCache& cache, CudaStreams& streams) {
   int N = cache.N;
-  cache.LoadBias(nn.b);
 
+  streams.synchronize(0);
+  streams.synchronize(2);
   myGEMM(nn.W[0], X, cache.z[0], 1., 1., nn.H[1], N, nn.H[0], true);
 
   deviceSigmoid(cache.z[0], nn.H[1], N);
   cache.recordAFromZ();
 
+  streams.synchronize(1);
+  streams.synchronize(3);
   myGEMM(nn.W[1], cache.z[0], cache.z[1], 1., 1., nn.H[2], N, nn.H[1], true);
 
   deviceSoftmax(cache.z[1], nn.H[2], N);
@@ -425,19 +399,18 @@ void parallel_feedforward(DeviceNeuralNetwork& nn, real* X,
 }
 
 void parallel_backprop(DeviceNeuralNetwork& nn, real* y, real reg,
-              DeviceCache& bpcache, DeviceGrads& bpgrads, real contrib) {
+              DeviceCache& bpcache, DeviceGrads& bpgrads, real contrib,
+              CudaStreams& streams) {
 
   int N = bpcache.N;
-  bpgrads.LoadWeightMatrices(nn.W);
 
   real* diff = deviceToDeviceCopy(y, nn.H[2]* N);   // reuse
   deviceSubtract(bpcache.yc, diff, 1.0/N, nn.H[2], N);
 
-  myGEMM(diff, bpcache.a[0], bpgrads.dW[1], 
-          contrib, contrib * reg, nn.H[2], nn.H[1], N, 
+  myGEMMAsync(diff, bpcache.a[0], bpgrads.dW[1], 
+          contrib, contrib * reg, nn.H[2], nn.H[1], N, streams, 1,
           false, false, true);
-
-  deviceSum(diff, bpgrads.db[1], contrib, nn.H[2], N);
+  deviceSum(diff, bpgrads.db[1], contrib, nn.H[2], N, streams, 3);
 
   setToZero(bpgrads.dz, nn.H[1]*N);
   myGEMM(nn.W[1], diff, bpgrads.dz, 1., 0., nn.H[1], N, nn.H[2], 
@@ -445,11 +418,11 @@ void parallel_backprop(DeviceNeuralNetwork& nn, real* y, real reg,
 
   deviceSigmoidBackward(bpcache.a[0], bpgrads.dz, nn.H[1], N);
 
-  myGEMM(bpgrads.dz, bpcache.X, bpgrads.dW[0], 
-          contrib, contrib * reg, nn.H[1], nn.H[0], N, 
+  myGEMMAsync(bpgrads.dz, bpcache.X, bpgrads.dW[0], 
+          contrib, contrib * reg, nn.H[1], nn.H[0], N, streams, 0,
           false, false, true);
 
-  deviceSum(bpgrads.dz, bpgrads.db[0], contrib, nn.H[1], N);
+  deviceSum(bpgrads.dz, bpgrads.db[0], contrib, nn.H[1], N, streams, 2);
 }
 
 void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
@@ -471,16 +444,15 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
   const int num_batches = (N + batch_size - 1) / batch_size;
 
   // Host data 
-  HostData host(num_batches, ceil_minibatch_size, nn, N);
+  HostData host(nn.H, N);
   if (rank == 0) {
-    host.X = arma::Mat<real>(X.memptr(), img_size, N);
-    host.y = arma::Mat<real>(y.memptr(), n_classes, N);
+    host.copyDataToHost(X.memptr(), y.memptr());
   }
 
   MPI_Request xy_reqs[2];
-  MPI_SAFE_CALL(MPI_Ibcast(host.X.memptr(), img_size * N, MPI_FP, 0, 
+  MPI_SAFE_CALL(MPI_Ibcast(host.X, img_size * N, MPI_FP, 0, 
                           MPI_COMM_WORLD, &xy_reqs[0]));
-  MPI_SAFE_CALL(MPI_Ibcast(host.y.memptr(), n_classes * N, MPI_FP, 0, 
+  MPI_SAFE_CALL(MPI_Ibcast(host.y, n_classes * N, MPI_FP, 0, 
                           MPI_COMM_WORLD, &xy_reqs[1]));
 
   // Device Data
@@ -489,13 +461,16 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
   DeviceGrads grads(nn.H, N);
   DeviceCache cache(nn.H, ceil_minibatch_size);
 
+  // Create streams
+  CudaStreams streams;
+
   std::ofstream error_file;
   error_file.open("Outputs/CpuGpuDiff.txt");
   int print_flag = 0;
   int iter = 0;
 
   MPI_SAFE_CALL(MPI_Waitall(2, xy_reqs, MPI_STATUS_IGNORE));
-  DeviceData data(host.X.memptr(), host.y.memptr(), N, img_size, n_classes);
+  DeviceData data(host.X, host.y, N, img_size, n_classes);
 
   for (int epoch = 0; epoch < epochs; ++epoch) {
     for (int batch = 0; batch < num_batches; ++batch) {
@@ -514,34 +489,16 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
       cache.N = curr_minibatch_size;
       cache.X = data.X + col*img_size;
 
+      streams.synchronizeAll();
+      grads.LoadWeightMatrices(dnn.W, streams);
+      cache.LoadBias(dnn.b, streams);
+
       // 2. compute each sub-batch of images' contribution to network coefficient updates
-      parallel_feedforward(dnn, data.X + col * img_size, cache);
-      parallel_backprop(dnn, data.y + col * n_classes, reg, cache, grads, contrib);
+      parallel_feedforward(dnn, data.X + col * img_size, cache, streams);
+      parallel_backprop(dnn, data.y + col * n_classes, reg, cache, grads, contrib, streams);
 
       // 3. reduce the coefficient updates and broadcast to all nodes with`MPI_Allreduce()
-      // Copy gradients from device to host 
-      grads.CopyToHost(host.grads.dW, host.grads.db);
-      MPI_Request reqs[nn.num_layers * 2];
-      MPI_SAFE_CALL(MPI_Iallreduce(host.grads.dW[0].memptr(), host.dW[0].memptr(), 
-                    nn.H[0] * nn.H[1], MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[0]));
-
-      MPI_SAFE_CALL(MPI_Iallreduce(host.grads.db[0].memptr(), host.db[0].memptr(), 
-                    nn.H[1], MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[2]));
-
-      MPI_SAFE_CALL(MPI_Iallreduce(host.grads.dW[1].memptr(), host.dW[1].memptr(), 
-                    nn.H[1] * nn.H[2], MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[1]));
-
-      MPI_SAFE_CALL(MPI_Iallreduce(host.grads.db[1].memptr(), host.db[1].memptr(), 
-                    nn.H[2], MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[3])); 
-
-      MPI_SAFE_CALL(MPI_Waitall(nn.num_layers * 2, reqs, MPI_STATUS_IGNORE));
-      grads.CopyToDevice(host.dW, host.db);
-
-      // 4. update local network coefficient at each node
-      deviceUpdateParam(grads.dW[0], dnn.W[0], learning_rate, nn.H[1], nn.H[0]);
-      deviceUpdateParam(grads.db[0], dnn.b[0], learning_rate, nn.H[1], 1); 
-      deviceUpdateParam(grads.dW[1], dnn.W[1], learning_rate, nn.H[2], nn.H[1]);
-      deviceUpdateParam(grads.db[1], dnn.b[1], learning_rate, nn.H[2], 1);    
+      deviceUpdateStep(host, grads, dnn, learning_rate, streams);   
 
       // +-*=+-*=+-*=+-*=+-*=+-*=+-*=+-*=+*-=+-*=+*-=+-*=+-*=+-*=+-*=+-*= //
       //                    POST-PROCESS OPTIONS                          //
@@ -561,6 +518,7 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
       iter++;
     }
   }
+  streams.synchronizeAll();
   dnn.CopyToHost(nn.W, nn.b);
   error_file.close();
 }

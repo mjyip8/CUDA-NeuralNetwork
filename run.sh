@@ -35,6 +35,7 @@ cd $SLURM_SUBMIT_DIR
 # Grading mode 4
 # echo "./main -g 4"
 # ./main -g 4
+time mpirun -np 1 ./main -g 3
 
 # Comment out to run the rest
 exit 0

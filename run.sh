@@ -34,11 +34,11 @@ cd $SLURM_SUBMIT_DIR
 
 # Grading mode 4
 # echo "./main -g 4"
-./main -g 4
+#./main -g 4
 # time mpirun -np 1 ./main -g 3
 
 # Comment out to run the rest
-exit 0
+#exit 0
 
 # Loop through grading modes 1, 2, and 3
 # Errors are outputted in the directories Outputs_{1,2,3}

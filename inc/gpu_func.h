@@ -166,6 +166,34 @@ class DeviceGrads {
     }
 };
 
+class SendData {
+  public:
+    real* X = nullptr;
+    real* y = nullptr;
+    int N;
+    std::vector<int> H;
+    const int num_layers = 2;
+    bool isAllocated = false;
+
+    SendData(std::vector<int> _H, int _N) : H(_H), N(_N) {
+    }
+
+    ~SendData() {
+      if (isAllocated) {
+        cudaFreeHost(X);
+        cudaFreeHost(y);
+      }
+    }
+
+    void copyDataToHost(const real* hX, const real* hy) {
+      isAllocated = true;
+      checkCudaErrors( cudaMallocHost(&X, sizeof(real) * N * H[0]) );
+      checkCudaErrors( cudaMallocHost(&y, sizeof(real) * N * H[2]) );
+      checkCudaErrors( cudaMemcpy(X, hX, sizeof(real) * N * H[0], cudaMemcpyHostToHost) );
+      checkCudaErrors( cudaMemcpy(y, hy, sizeof(real) * N * H[2], cudaMemcpyHostToHost) );
+    }
+};
+
 class HostData {
   public:
     real* X;
@@ -240,8 +268,9 @@ class DeviceCache {
       checkCudaErrors(cudaFree(z[1]));
     }
 
-    void recordAFromZ() {
-      checkCudaErrors(cudaMemcpy(a[0], z[0], sizeof(real) * H[1] * N, cudaMemcpyDeviceToDevice));
+    void recordAFromZ(CudaStreams& streams) {
+      checkCudaErrors(cudaMemcpyAsync(a[0], z[0], sizeof(real) * H[1] * N, 
+                      cudaMemcpyDeviceToDevice, streams.stream[1]));
     }
 
     void LoadBias(std::vector<real *>& b, CudaStreams& streams) {
@@ -256,21 +285,24 @@ class DeviceData {
   public: 
     real* X;
     real* y; // y is one hot
+    int img_size;
+    int n_classes;
     int N;
-    int K;
 
-    DeviceData(const real* hX, const real* hy, int _N, int _K, int numclasses) {
-      N = _N;
-      K = _K;
-      checkCudaErrors(cudaMalloc(&X, sizeof(real) * N * K));
-      checkCudaErrors(cudaMalloc(&y, sizeof(real) * N * numclasses));
-      checkCudaErrors(cudaMemcpy(X, hX, sizeof(real) * N * K, cudaMemcpyHostToDevice));  
-      checkCudaErrors(cudaMemcpy(y, hy, sizeof(real) * N * numclasses, cudaMemcpyHostToDevice));
+    DeviceData(int _N, int _img_size, int _n_classes) :
+              N(_N), img_size(_img_size), n_classes(_n_classes) {
+      checkCudaErrors(cudaMalloc(&X, sizeof(real) * N * img_size));
+      checkCudaErrors(cudaMalloc(&y, sizeof(real) * N * n_classes));
     }
 
     ~DeviceData() {
       checkCudaErrors(cudaFree(X));
       checkCudaErrors(cudaFree(y));
+    }
+
+    void CopyToDevice(real* hX, real* hy, int X_offset, int y_offset, int n) {
+      checkCudaErrors(cudaMemcpy(X + X_offset, hX + X_offset, sizeof(real) * n * img_size, cudaMemcpyHostToDevice));  
+      checkCudaErrors(cudaMemcpy(y + y_offset, hy + y_offset, sizeof(real) * n * n_classes, cudaMemcpyHostToDevice));
     }
 };
 
@@ -304,8 +336,6 @@ class DeviceDataVec {
                       cudaMemcpyHostToDevice));
       
     }
-
-
 };
 
 /***************************************************************/

@@ -387,7 +387,7 @@ void parallel_feedforward(DeviceNeuralNetwork& nn, real* X,
   myGEMM(nn.W[0], X, cache.z[0], 1., 1., nn.H[1], N, nn.H[0], true);
 
   deviceSigmoid(cache.z[0], nn.H[1], N);
-  cache.recordAFromZ();
+  cache.recordAFromZ(streams);
 
   streams.synchronize(1);
   streams.synchronize(3);
@@ -425,6 +425,41 @@ void parallel_backprop(DeviceNeuralNetwork& nn, real* y, real reg,
   deviceSum(bpgrads.dz, bpgrads.db[0], contrib, nn.H[1], N, streams, 2);
 }
 
+void scatter_data(SendData& send, HostData& host, const int num_batches, 
+                  const int batch_size, const int N, const int rank, 
+                  const int num_procs, const int img_size, const int n_classes, 
+                  MPI_Request xy_reqs[]) {
+  int ceil_minibatch_size = (batch_size + num_procs - 1) / num_procs;
+
+  MPIBatchInfo bi(num_procs, batch_size, N);
+  for (int batch = 0; batch < num_batches; ++batch) {
+    int first_col = batch_size * batch;
+    int last_col = std::min((batch + 1) * batch_size - 1, N - 1);
+    int total_batch_size = last_col - first_col + 1;
+    int minibatch_size = (total_batch_size + num_procs - 1) / num_procs;
+    int last_batch_size = (total_batch_size % minibatch_size)? 
+                          total_batch_size % minibatch_size : minibatch_size;
+    int recv_minibatch_size = (rank < num_procs - 1)? 
+                                            minibatch_size : last_batch_size;
+
+    int X_batch_offset = first_col * img_size;
+    int y_batch_offset = first_col * n_classes;
+
+    int X_offset = ceil_minibatch_size * batch * img_size;
+    int y_offset = ceil_minibatch_size * batch * n_classes;
+
+    if (rank == 0)
+      bi.batchScatterArgs(img_size, n_classes, total_batch_size);
+
+    MPI_SAFE_CALL(MPI_Iscatterv(send.X + X_batch_offset, bi.minibatch_sizes_X, bi.displacements_X, 
+              MPI_FP, host.X + X_offset, recv_minibatch_size * img_size, MPI_FP, 
+              0, MPI_COMM_WORLD, &xy_reqs[batch]));
+    MPI_SAFE_CALL(MPI_Iscatterv(send.y + y_batch_offset, bi.minibatch_sizes_y, bi.displacements_y, 
+              MPI_FP, host.y + y_offset, recv_minibatch_size * n_classes, MPI_FP, 
+              0, MPI_COMM_WORLD, &xy_reqs[batch + num_batches]));
+  }
+}
+
 void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
                     const arma::Mat<real>& y, real learning_rate, real reg,
                     const int epochs, const int batch_size, bool grad_check,
@@ -439,23 +474,21 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
   int img_size = nn.H[0];
   int n_classes = nn.H[2];
 
-  int total_batch_size = std::min(batch_size, N);
-  int ceil_minibatch_size = (total_batch_size + num_procs - 1) / num_procs;
+  int ceil_minibatch_size = (batch_size + num_procs - 1) / num_procs;
   const int num_batches = (N + batch_size - 1) / batch_size;
 
-  // Host data 
-  HostData host(nn.H, N);
+  HostData host(nn.H, ceil_minibatch_size * num_batches);
+  SendData send(nn.H, N);
   if (rank == 0) {
-    host.copyDataToHost(X.memptr(), y.memptr());
+    send.copyDataToHost(X.memptr(), y.memptr());
   }
 
-  MPI_Request xy_reqs[2];
-  MPI_SAFE_CALL(MPI_Ibcast(host.X, img_size * N, MPI_FP, 0, 
-                          MPI_COMM_WORLD, &xy_reqs[0]));
-  MPI_SAFE_CALL(MPI_Ibcast(host.y, n_classes * N, MPI_FP, 0, 
-                          MPI_COMM_WORLD, &xy_reqs[1]));
+  MPI_Request xy_reqs[num_batches * 2];
+  scatter_data(send, host, num_batches, batch_size, N, rank, 
+              num_procs, img_size, n_classes, xy_reqs);
 
-  // Device Data
+  // Device Variables
+  DeviceData data(ceil_minibatch_size * num_batches, img_size, n_classes);
   DeviceNeuralNetwork dnn(nn.H);
   dnn.CopyToDevice(nn.W, nn.b);
   DeviceGrads grads(nn.H, N);
@@ -469,33 +502,36 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
   int print_flag = 0;
   int iter = 0;
 
-  MPI_SAFE_CALL(MPI_Waitall(2, xy_reqs, MPI_STATUS_IGNORE));
-  DeviceData data(host.X, host.y, N, img_size, n_classes);
-
   for (int epoch = 0; epoch < epochs; ++epoch) {
     for (int batch = 0; batch < num_batches; ++batch) {
       int first_col = batch_size * batch;
       int last_col = std::min((batch + 1) * batch_size, N);
-      total_batch_size = last_col - first_col;
+      int total_batch_size = last_col - first_col;
       int minibatch_size = (total_batch_size + num_procs - 1) / num_procs;
       int last_batch_size = (total_batch_size % minibatch_size)? 
                             total_batch_size % minibatch_size : minibatch_size;
       int curr_minibatch_size = (rank < num_procs - 1)? 
                                               minibatch_size : last_batch_size;
 
+      int X_offset = ceil_minibatch_size * batch * img_size;
+      int y_offset = ceil_minibatch_size * batch * n_classes;
+      if (epoch == 0) {
+        MPI_Wait(&xy_reqs[batch], MPI_STATUS_IGNORE);
+        MPI_Wait(&xy_reqs[batch + num_batches], MPI_STATUS_IGNORE);
+        data.CopyToDevice(host.X, host.y, X_offset, y_offset, curr_minibatch_size);
+      }
       // Device variables 
-      real contrib = ((real) minibatch_size) / ((real) total_batch_size);
-      int col = first_col + (minibatch_size * rank);
+      real contrib = ((real) curr_minibatch_size) / ((real) total_batch_size);
       cache.N = curr_minibatch_size;
-      cache.X = data.X + col*img_size;
+      cache.X = data.X + X_offset;
 
       streams.synchronizeAll();
       grads.LoadWeightMatrices(dnn.W, streams);
       cache.LoadBias(dnn.b, streams);
 
       // 2. compute each sub-batch of images' contribution to network coefficient updates
-      parallel_feedforward(dnn, data.X + col * img_size, cache, streams);
-      parallel_backprop(dnn, data.y + col * n_classes, reg, cache, grads, contrib, streams);
+      parallel_feedforward(dnn, data.X + X_offset, cache, streams);
+      parallel_backprop(dnn, data.y + y_offset, reg, cache, grads, contrib, streams);
 
       // 3. reduce the coefficient updates and broadcast to all nodes with`MPI_Allreduce()
       deviceUpdateStep(host, grads, dnn, learning_rate, streams);   

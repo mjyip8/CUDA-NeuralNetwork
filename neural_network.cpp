@@ -469,15 +469,17 @@ void parallel_train(NeuralNetwork& nn, const arma::Mat<real>& X,
   MPI_SAFE_CALL(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
 
   int N = (rank == 0) ? X.n_cols : 0;
-  MPI_SAFE_CALL(MPI_Bcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD));
+  MPI_Request n;
+  MPI_SAFE_CALL(MPI_Ibcast(&N, 1, MPI_INT, 0, MPI_COMM_WORLD, &n));
 
+  HostData host(nn.H);
   int img_size = nn.H[0];
   int n_classes = nn.H[2];
+  MPI_Wait(&n, MPI_STATUS_IGNORE);
+  host.initialize_xy(N);
 
   int ceil_minibatch_size = (batch_size + num_procs - 1) / num_procs;
   const int num_batches = (N + batch_size - 1) / batch_size;
-
-  HostData host(nn.H, ceil_minibatch_size * num_batches);
   SendData send(nn.H, N);
   if (rank == 0) {
     send.copyDataToHost(X.memptr(), y.memptr());

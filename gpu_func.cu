@@ -11,7 +11,7 @@
 #define STRIDED_SMEM 3
 #define BLOCK_SIZE 32
 
-#define SMAX_STRIDE 16
+#define SMAX_STRIDE 32
 #define N_CLASSES 10
 #define SUM_STRIDE 32
 
@@ -194,23 +194,27 @@ void softmax(real* Z, int M, int N) {
 
     if (gCol < N) {
         smem_exp[col][row] = exp(Z[gRow + gCol * M]);
+    }
     
-        __syncthreads();
-
-        if (row % psum_stride == 0) {
-            int psum_idx = row / psum_stride;
-            smem_sum[col][psum_idx] = 0;
-            for (int i = 0; i < psum_stride; ++i) {
-                smem_sum[col][psum_idx] += smem_exp[col][row + i];
-            }
+    __syncthreads();
+    
+    if (gCol < N && row % psum_stride == 0) {
+        int psum_idx = row / psum_stride;
+        smem_sum[col][psum_idx] = 0;
+        for (int i = 0; i < psum_stride; ++i) {
+            smem_sum[col][psum_idx] += smem_exp[col][row + i];
         }
-        __syncthreads();
+    }
+    
+    __syncthreads();
 
-        if (row == 0) {
-            smem_sum[col][0] += smem_sum[col][1];
-        }
-        __syncthreads();
+    if (gCol < N && row == 0) {
+        smem_sum[col][0] += smem_sum[col][1];
+    }
+    
+    __syncthreads();
 
+    if (gCol < N) {
         Z[gRow + gCol * M] = smem_exp[col][row] / smem_sum[col][0];
     }
 }
@@ -484,7 +488,6 @@ void deviceUpdateStep(HostData& host, DeviceGrads& grads, DeviceNeuralNetwork& d
     checkCudaErrors(cudaMemcpyAsync(grads.dW[0], host.sum_dW[0], sizeof(real) * dnn.H[1] * dnn.H[0], 
                       cudaMemcpyHostToDevice, streams.stream[0]));
 
-    // Performing the actual update
     deviceUpdateParam(grads.dW[0], dnn.W[0], learning_rate, dnn.H[1], dnn.H[0], streams.stream[0]);
     deviceUpdateParam(grads.db[0], dnn.b[0], learning_rate, dnn.H[1], 1, streams.stream[2]); 
     deviceUpdateParam(grads.dW[1], dnn.W[1], learning_rate, dnn.H[2], dnn.H[1], streams.stream[1]);

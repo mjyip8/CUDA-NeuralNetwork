@@ -175,29 +175,28 @@ class SendData {
     const int num_layers = 2;
     bool isAllocated = false;
 
-    SendData(std::vector<int> _H, int _N) : H(_H), N(_N) {
-    }
+    SendData(std::vector<int> _H, int _N) : H(_H), N(_N) {}
 
     ~SendData() {
-      if (isAllocated) {
-        cudaFreeHost(X);
-        cudaFreeHost(y);
-      }
+      X = nullptr;
+      y = nullptr;
     }
 
     void copyDataToHost(const real* hX, const real* hy) {
-      isAllocated = true;
-      checkCudaErrors( cudaMallocHost(&X, sizeof(real) * N * H[0]) );
-      checkCudaErrors( cudaMallocHost(&y, sizeof(real) * N * H[2]) );
-      checkCudaErrors( cudaMemcpy(X, hX, sizeof(real) * N * H[0], cudaMemcpyHostToHost) );
-      checkCudaErrors( cudaMemcpy(y, hy, sizeof(real) * N * H[2], cudaMemcpyHostToHost) );
+      X_mat = arma::Mat<real>(hX, H[0], N);
+      y_mat = arma::Mat<real>(hy, H[2], N);
+      X = X_mat.memptr();
+      y = y_mat.memptr();
     }
+  private:
+    arma::Mat<real> X_mat;
+    arma::Mat<real> y_mat;
 };
 
 class HostData {
   public:
-    real* X;
-    real* y;
+    real* X = nullptr;
+    real* y = nullptr;
 
     std::vector<real*> local_dW;
     std::vector<real*> local_db;
@@ -207,22 +206,28 @@ class HostData {
     std::vector<int> H;
     const int num_layers = 2;
 
-    HostData(std::vector<int> _H, int _N) : H(_H), N(_N) {
-      checkCudaErrors( cudaMallocHost(&X, sizeof(real) * N * H[0]) );
-      checkCudaErrors( cudaMallocHost(&y, sizeof(real) * N * H[2]) );
+    HostData(std::vector<int> _H) : H(_H) {
       initialize(local_dW, local_db);
       initialize(sum_dW, sum_db);
     }
 
     ~HostData() {
       for (size_t i = 0; i < local_dW.size(); ++i) {
-        cudaFreeHost(local_dW[i]);
-        cudaFreeHost(sum_dW[i]);
-        cudaFreeHost(local_db[i]);
-        cudaFreeHost(sum_db[i]);
+        checkCudaErrors(cudaFreeHost(local_dW[i]));
+        checkCudaErrors(cudaFreeHost(local_db[i]));
+        checkCudaErrors(cudaFreeHost(sum_dW[i]));
+        checkCudaErrors(cudaFreeHost(sum_db[i]));
       }
-      cudaFreeHost(X);
-      cudaFreeHost(y);
+      X = nullptr;
+      y = nullptr;
+    }
+
+    void initialize_xy(int _N) {
+      N = _N;
+      X_mat.resize(H[0], N);
+      y_mat.resize(H[2], N);
+      X = X_mat.memptr();
+      y = y_mat.memptr();
     }
 
     void copyDataToHost(const real* hX, const real* hy) {
@@ -231,6 +236,9 @@ class HostData {
     }
 
   private:
+    arma::Mat<real> X_mat;
+    arma::Mat<real> y_mat;
+
     void initialize(std::vector<real*>& W, std::vector<real*>& b) {
       W.resize((size_t) num_layers);
       b.resize((size_t) num_layers);

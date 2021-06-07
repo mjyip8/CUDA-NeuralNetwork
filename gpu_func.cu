@@ -4,14 +4,26 @@
 #include <helper_functions.h>
 #include <iostream>
 #include "cublas_v2.h"
+#include "mpi.h"
 
 #define GLOBAL 1
 #define SMEM 2
+#define STRIDED_SMEM 3
 #define BLOCK_SIZE 32
 
-#define SMAX_STRIDE 16
+#define SMAX_STRIDE 32
 #define N_CLASSES 10
 #define SUM_STRIDE 32
+
+#define MPI_SAFE_CALL(call)                                                  \
+  do {                                                                       \
+    int err = call;                                                          \
+    if (err != MPI_SUCCESS) {                                                \
+      fprintf(stderr, "MPI error %d in file '%s' at line %i", err, __FILE__, \
+              __LINE__);                                                     \
+      exit(1);                                                               \
+    }                                                                        \
+  } while (0)
 
 /***************************************************************
  *                           KERNELS
@@ -93,6 +105,72 @@ void smeMM(real* __restrict__ A, real* __restrict__ B,
     }
 }
 
+__global__
+void stridedSMEMM(real* __restrict__ A, real* __restrict__ B,
+           real* __restrict__ C, real alpha, real beta,
+           int M, int N, int K, 
+           bool isVec, bool transposeA, bool transposeB) {
+    int blockRow = blockIdx.y * 64;
+    int blockCol = blockIdx.x * 16;
+    int row = threadIdx.y;
+    int col = threadIdx.x;
+    int tr = threadIdx.y + blockDim.y * threadIdx.x;
+    int gRow = blockRow + tr;
+
+    if (blockRow >= M || blockCol >= N) return;
+
+    real accumulator[16];
+    memset(&accumulator[0], 0, sizeof(real) * 16);               
+    real A_miniblock[4];
+
+    __shared__ real B_block[16][4];
+
+    for (int ptr = 0; ptr < K; ptr += 4) {
+        int br = ptr + col;
+        int bc = blockCol + row;
+        if (br < K && bc < N) {
+            int gB_index = (transposeB)? bc + br * N : br + bc * K;
+            B_block[row][col] = B[gB_index];
+        }
+
+        __syncthreads();
+
+        memset(&A_miniblock[0], 0, sizeof(real) * 4);
+
+        if (gRow < M) {
+            # pragma unroll 
+            for (int i = 0; i < 4 && ptr + i < K; ++i) {
+                int gA_index = (transposeA)? (ptr + i) + gRow * K : gRow + (ptr + i) * M;
+                A_miniblock[i] = A[gA_index];
+            }
+        }
+
+        # pragma unroll 
+        for (int c = 0; c < 16; ++c) {
+            for (int r = 0; r < 4; ++r) {
+                accumulator[c] += A_miniblock[r] * B_block[c][r];
+            }
+        }
+
+        __syncthreads();
+
+    }
+
+    if (gRow >= M) return;
+
+    # pragma unroll
+    for (int c = 0; c < 16; ++c) {
+        if (blockCol + c >= N) break;
+        int idx = gRow + (blockCol + c) * M;
+        real add_term = 0.;
+        if (beta) {
+            real C_term = (isVec) ? C[gRow + N*M] : C[idx];
+            add_term = beta * C_term;
+        }
+        C[idx] = accumulator[c] * alpha + add_term;
+    }
+}
+
 /*------------------ FORWARD PASS KERNELS ---------------------*/
 
 __global__
@@ -116,23 +194,27 @@ void softmax(real* Z, int M, int N) {
 
     if (gCol < N) {
         smem_exp[col][row] = exp(Z[gRow + gCol * M]);
+    }
     
-        __syncthreads();
-
-        if (row % psum_stride == 0) {
-            int psum_idx = row / psum_stride;
-            smem_sum[col][psum_idx] = 0;
-            for (int i = 0; i < psum_stride; ++i) {
-                smem_sum[col][psum_idx] += smem_exp[col][row + i];
-            }
+    __syncthreads();
+    
+    if (gCol < N && row % psum_stride == 0) {
+        int psum_idx = row / psum_stride;
+        smem_sum[col][psum_idx] = 0;
+        for (int i = 0; i < psum_stride; ++i) {
+            smem_sum[col][psum_idx] += smem_exp[col][row + i];
         }
-        __syncthreads();
+    }
+    
+    __syncthreads();
 
-        if (row == 0) {
-            smem_sum[col][0] += smem_sum[col][1];
-        }
-        __syncthreads();
+    if (gCol < N && row == 0) {
+        smem_sum[col][0] += smem_sum[col][1];
+    }
+    
+    __syncthreads();
 
+    if (gCol < N) {
         Z[gRow + gCol * M] = smem_exp[col][row] / smem_sum[col][0];
     }
 }
@@ -145,6 +227,14 @@ void subtract(real* A, real*B, real k, int M, int N) {
     const int col = blockDim.y * blockIdx.y + threadIdx.y;
     if (row >= M || col >= N) return;
     B[row + col * M] = k * (A[row + col * M] - B[row + col * M]);
+}
+
+__global__ 
+void updateParam(real* A, real*B, real lr, int M, int N) {
+    const int row = blockDim.x * blockIdx.x + threadIdx.x;
+    const int col = blockDim.y * blockIdx.y + threadIdx.y;
+    if (row >= M || col >= N) return;
+    B[row + col * M] = B[row + col * M] - (lr * A[row + col * M]);
 }
 
 __global__ 
@@ -213,13 +303,18 @@ int myGEMM(real* __restrict__ A, real* __restrict__ B,
            bool isVec, bool transposeA, bool transposeB) {
     dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
     dim3 blocks((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
-    int algorithm = GLOBAL;
+    int algorithm = STRIDED_SMEM;
     switch (algorithm) {
         case GLOBAL:
             globalMM<<<blocks, threads>>>(A, B, C, *alpha, *beta, M, N, K, isVec, transposeA, transposeB);
             break;
         case SMEM:
             smeMM<<<blocks, threads>>>(A, B, C, *alpha, *beta, M, N, K, isVec, transposeA, transposeB);
+            break;
+        case STRIDED_SMEM:
+            dim3 stridedThreads(4, 16);
+            dim3 stridedBlocks((N + 15) / 16, (M + 63) / 64);
+            stridedSMEMM<<<stridedBlocks, stridedThreads>>>(A, B, C, *alpha, *beta, M, N, K, isVec, transposeA, transposeB);
             break;
       }
   return 0;
@@ -232,7 +327,7 @@ int myGEMM(real* __restrict__ A, real* __restrict__ B,
            bool isVec, bool transposeA, bool transposeB) {
     dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
     dim3 blocks((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
-    int algorithm = SMEM;
+    int algorithm = STRIDED_SMEM;
     switch (algorithm) {
         case GLOBAL:
             globalMM<<<blocks, threads>>>(A, B, C, alpha, beta, M, N, K, isVec, transposeA, transposeB);
@@ -240,32 +335,39 @@ int myGEMM(real* __restrict__ A, real* __restrict__ B,
         case SMEM:
             smeMM<<<blocks, threads>>>(A, B, C, alpha, beta, M, N, K, isVec, transposeA, transposeB);
             break;
+        case STRIDED_SMEM:
+            dim3 stridedThreads(4, 16);
+            dim3 stridedBlocks((N + 15) / 16, (M + 63) / 64);
+            stridedSMEMM<<<stridedBlocks, stridedThreads>>>(A, B, C, alpha, beta, M, N, K, isVec, transposeA, transposeB);
+            break;
       }
   return 0;
 }
 
-int myGEMMAlloc(real* __restrict__ A, real* __restrict__ B,
-           real*& C, real alpha, real beta,
-           int M, int N, int K, 
+int myGEMMAsync(real* __restrict__ A, real* __restrict__ B,
+           real* __restrict__ C, real alpha, real beta,
+           int M, int N, int K, CudaStreams& streams, int i,
            bool isVec, bool transposeA, bool transposeB) {
-    checkCudaErrors(cudaMalloc(&C, sizeof(real) * M * N));
-    checkCudaErrors(cudaMemset(C, 0, sizeof(real)));
-    return myGEMM(A, B, C, alpha, beta, M, N, K, isVec, transposeA, transposeB);
+    dim3 threads(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 blocks((N + BLOCK_SIZE - 1) / BLOCK_SIZE, (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    int algorithm = STRIDED_SMEM;
+    switch (algorithm) {
+        case GLOBAL:
+            globalMM<<<blocks, threads, 0, streams.stream[i]>>>(A, B, C, alpha, beta, M, N, K, isVec, transposeA, transposeB);
+            break;
+        case SMEM:
+            smeMM<<<blocks, threads, 0, streams.stream[i]>>>(A, B, C, alpha, beta, M, N, K, isVec, transposeA, transposeB);
+            break;
+        case STRIDED_SMEM:
+            dim3 stridedThreads(4, 16);
+            dim3 stridedBlocks((N + 15) / 16, (M + 63) / 64);
+            stridedSMEMM<<<stridedBlocks, stridedThreads, 0, streams.stream[i]>>>(A, B, C, alpha, beta, M, N, K, isVec, transposeA, transposeB);
+            break;
+      }
+  return 0;
 }
 
 /*------------------ FORWARD PASS WRAPPERS ---------------------*/
-
-real* deviceLinear(real* A, real* B, real* C, real* alpha, real* beta, int M, int N,
-           int K, bool isVec, bool transposeB) {
-    real* result;
-    checkCudaErrors(cudaMalloc(&result, sizeof(real) * M * N));
-
-    myGEMM(A, B, C, alpha, beta, M, N, K, isVec, transposeB);
-
-    checkCudaErrors(cudaMemcpy(result, C, sizeof(real) * M * N, cudaMemcpyDeviceToDevice));
-
-    return result;
-}
 
 void deviceSigmoid(real* Z, int M, int N) {
     real* result;
@@ -290,7 +392,7 @@ void deviceSubtract(real* A, real*B, real k, int M, int N) {
     subtract<<<blockDims, threadDims>>>(A, B, k, M, N);
 }
 
-void deviceSum(real* A, real* result, real k, int K, int N) {
+void deviceSum(real* A, real* result, real k, int K, int N, CudaStreams& streams, int i) {
 
     // batch_size cases: 800, 400, 267, 266, 200, 100
     dim3 gridDim(K);
@@ -299,31 +401,31 @@ void deviceSum(real* A, real* result, real k, int K, int N) {
     size_t sharedMemSize;
 
     int floor_N = (N / 2) * 2;
-    if (floor_N == 800) {
+    if (floor_N > 512) {
         threads = 512;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
-        sum<512><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
-    } else if (floor_N == 400) { 
+        sum<512><<<gridDim, blockDim, sharedMemSize, streams.stream[i]>>>(A, result, k, K, N);
+    } else if (floor_N <= 512 && floor_N > 256) { 
         threads = 256;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
-        sum<256><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
-    } else if (floor_N == 266) {
+        sum<256><<<gridDim, blockDim, sharedMemSize, streams.stream[i]>>>(A, result, k, K, N);
+    } else if (floor_N <= 256 && floor_N > 128) {
         threads = 128;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
-        sum<128><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
-    } else if (floor_N == 100) {
+        sum<128><<<gridDim, blockDim, sharedMemSize, streams.stream[i]>>>(A, result, k, K, N);
+    } else if (floor_N <= 128 && floor_N > 64) {
         threads = 64;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
-        sum<64><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
+        sum<64><<<gridDim, blockDim, sharedMemSize, streams.stream[i]>>>(A, result, k, K, N);
     } else {
         threads = 32;
         blockDim.x = threads;
         sharedMemSize = threads * sizeof(real);
-        sum<32><<<gridDim, blockDim, sharedMemSize>>>(A, result, k, K, N);
+        sum<32><<<gridDim, blockDim, sharedMemSize, streams.stream[i]>>>(A, result, k, K, N);
     }
 }
 
@@ -333,6 +435,82 @@ void deviceSigmoidBackward(real* S, real* A, int M, int N) {
     sigmoidBackward<<<blockDims, threadDims>>>(S, A, M, N);
 }
 
+void deviceUpdateParam(real* A, real*B, real lr, int M, int N, cudaStream_t& s) {
+    dim3 threadDims(32, (N > 1)? 32 : 1);
+    dim3 blockDims((M + threadDims.x - 1) / threadDims.x, 
+                    (N > 1)? ((N + threadDims.y) / threadDims.y) : 1);
+    updateParam<<<blockDims, threadDims, 0, s>>>(A, B, lr, M, N);
+}
+
+void deviceUpdateStep(HostData& host, DeviceGrads& grads, DeviceNeuralNetwork& dnn, 
+                        real learning_rate, CudaStreams& streams) {
+
+    streams.synchronizeAll();
+    // Copying from device to host
+    checkCudaErrors(cudaMemcpyAsync(host.local_dW[0], grads.dW[0], sizeof(real) * grads.H[1] * grads.H[0], 
+                  cudaMemcpyDeviceToHost, streams.stream[0]));
+    checkCudaErrors(cudaMemcpyAsync(host.local_db[0], grads.db[0], sizeof(real) * grads.H[1], 
+                  cudaMemcpyDeviceToHost, streams.stream[2]));
+    checkCudaErrors(cudaMemcpyAsync(host.local_dW[1], grads.dW[1], sizeof(real) * grads.H[2] * grads.H[1], 
+                  cudaMemcpyDeviceToHost, streams.stream[1]));
+    checkCudaErrors(cudaMemcpyAsync(host.local_db[1], grads.db[1], sizeof(real) * grads.H[2], 
+                  cudaMemcpyDeviceToHost, streams.stream[3]));
+
+    // Performing the MPI Call Here
+    MPI_Request reqs[grads.num_layers * 2];
+    cudaStreamSynchronize(streams.stream[0]);
+    MPI_SAFE_CALL(MPI_Iallreduce(host.local_dW[0], host.sum_dW[0], 
+                dnn.H[0] * dnn.H[1], MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[0]));
+
+    cudaStreamSynchronize(streams.stream[2]);
+    MPI_SAFE_CALL(MPI_Iallreduce(host.local_db[0], host.sum_db[0], 
+                dnn.H[1], MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[2]));
+
+    cudaStreamSynchronize(streams.stream[1]);
+    MPI_SAFE_CALL(MPI_Iallreduce(host.local_dW[1], host.sum_dW[1],  
+                dnn.H[1] * dnn.H[2], MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[1]));
+
+    cudaStreamSynchronize(streams.stream[3]);
+    MPI_SAFE_CALL(MPI_Iallreduce(host.local_db[1], host.sum_db[1],
+                dnn.H[2], MPI_FP, MPI_SUM, MPI_COMM_WORLD, &reqs[3])); 
+
+    // Coping back to device
+    MPI_Wait(&reqs[3], MPI_STATUS_IGNORE);
+    checkCudaErrors(cudaMemcpyAsync(grads.db[1], host.sum_db[1], sizeof(real) * dnn.H[2], 
+                      cudaMemcpyHostToDevice, streams.stream[3]));
+    MPI_Wait(&reqs[1], MPI_STATUS_IGNORE);
+    checkCudaErrors(cudaMemcpyAsync(grads.dW[1], host.sum_dW[1], sizeof(real) * dnn.H[2] * dnn.H[1], 
+                      cudaMemcpyHostToDevice, streams.stream[1]));
+    MPI_Wait(&reqs[2], MPI_STATUS_IGNORE);
+    checkCudaErrors(cudaMemcpyAsync(grads.db[0], host.sum_db[0], sizeof(real) * dnn.H[1], 
+                      cudaMemcpyHostToDevice, streams.stream[2]));
+    MPI_Wait(&reqs[0], MPI_STATUS_IGNORE);
+    checkCudaErrors(cudaMemcpyAsync(grads.dW[0], host.sum_dW[0], sizeof(real) * dnn.H[1] * dnn.H[0], 
+                      cudaMemcpyHostToDevice, streams.stream[0]));
+
+    deviceUpdateParam(grads.dW[0], dnn.W[0], learning_rate, dnn.H[1], dnn.H[0], streams.stream[0]);
+    deviceUpdateParam(grads.db[0], dnn.b[0], learning_rate, dnn.H[1], 1, streams.stream[2]); 
+    deviceUpdateParam(grads.dW[1], dnn.W[1], learning_rate, dnn.H[2], dnn.H[1], streams.stream[1]);
+    deviceUpdateParam(grads.db[1], dnn.b[1], learning_rate, dnn.H[2], 1, streams.stream[3]); 
+}
+
+/*------------------ HELPER FUNCTIONS ---------------------*/
+
+void setToZero(real*& ptr, int size) {
+    checkCudaErrors(cudaMemset(ptr, 0, sizeof(real) * size));
+}
+
 void deviceCleanUp(real* ptr) { 
     checkCudaErrors(cudaFree(ptr)); 
+}
+
+void deviceMalloc(real*& ptr, int size) {
+  checkCudaErrors(cudaMalloc(&ptr, sizeof(real) * size));
+}
+
+real* deviceToDeviceCopy(real* orig, int size) {
+  real* ptr = nullptr;
+  checkCudaErrors(cudaMalloc(&ptr, sizeof(real) * size));
+  checkCudaErrors(cudaMemcpy(ptr, orig, sizeof(real) * size, cudaMemcpyDeviceToDevice));
+  return ptr;
 }
